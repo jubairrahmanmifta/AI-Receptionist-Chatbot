@@ -1,0 +1,6 @@
+config.json
+appointments.json
+venv/
+__pycache__/
+*.pyc
+.env

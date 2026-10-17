@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Smile Dental Care — Dhanmondi, Dhaka</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Hind+Siliguri:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --blue:    #1a56db;
+      --blue-dk: #1240a8;
+      --teal:    #0ea5a0;
+      --bg:      #f8faff;
+      --white:   #ffffff;
+      --text:    #1a1f36;
+      --muted:   #6b7280;
+      --border:  #e5e7eb;
+      --radius:  12px;
+    }
+    html { scroll-behavior: smooth; }
+    body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); }
+
+    /* NAV */
+    nav {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(255,255,255,0.96);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 48px; height: 66px;
+      display: flex; align-items: center;
+    }
+    .nav-logo { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+    .nav-logo .em   { font-size: 26px; }
+    .nav-logo .name { font-weight: 800; font-size: 17px; color: var(--blue); }
+    .nav-logo .sub  { font-size: 11px; color: var(--muted); }
+    .nav-links { margin-left: auto; display: flex; gap: 32px; }
+    .nav-links a { text-decoration: none; color: var(--muted); font-size: 14px; font-weight: 500; transition: color .2s; }
+    .nav-links a:hover { color: var(--blue); }
+    .nav-cta {
+      margin-left: 28px; padding: 9px 22px;
+      background: var(--blue); color: #fff;
+      border: none; border-radius: 8px;
+      font-size: 14px; font-weight: 600;
+      cursor: pointer; font-family: inherit;
+      transition: background .2s;
+    }
+    .nav-cta:hover { background: var(--blue-dk); }
+
+    /* HERO */
+    .hero {
+      min-height: 88vh; display: flex; align-items: center;
+      background: linear-gradient(135deg, #eef4ff 0%, #f0fafa 100%);
+      padding: 60px 80px; gap: 60px;
+    }
+    .hero-text { flex: 1; }
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: #dbeafe; color: var(--blue);
+      padding: 6px 14px; border-radius: 20px;
+      font-size: 13px; font-weight: 600; margin-bottom: 24px;
+    }
+    .hero h1 { font-size: 52px; font-weight: 800; line-height: 1.15; margin-bottom: 20px; }
+    .hero h1 span { color: var(--blue); }
+    .hero p  { font-size: 17px; color: var(--muted); line-height: 1.7; max-width: 460px; margin-bottom: 36px; }
+    .hero-btns { display: flex; gap: 14px; flex-wrap: wrap; }
+    .btn-primary {
+      display: inline-flex; align-items: center; gap: 10px;
+      padding: 15px 30px; background: var(--blue); color: #fff;
+      border: none; border-radius: 10px; font-size: 16px; font-weight: 700;
+      cursor: pointer; font-family: inherit; text-decoration: none;
+      box-shadow: 0 4px 20px rgba(26,86,219,.3); transition: all .2s;
+    }
+    .btn-primary:hover { background: var(--blue-dk); transform: translateY(-2px); }
+    .btn-primary .dot {
+      width: 9px; height: 9px; background: #4ade80;
+      border-radius: 50%; animation: pg 1.5s infinite;
+    }
+    @keyframes pg { 0%,100%{box-shadow:0 0 0 0 rgba(74,222,128,.5)} 50%{box-shadow:0 0 0 6px rgba(74,222,128,0)} }
+    .btn-outline {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 15px 26px; background: transparent;
+      color: var(--blue); border: 2px solid var(--blue);
+      border-radius: 10px; font-size: 15px; font-weight: 600;
+      cursor: pointer; font-family: inherit; text-decoration: none;
+      transition: all .2s;
+    }
+    .btn-outline:hover { background: #eef4ff; }
+
+    .hero-card {
+      flex: 0 0 320px; background: var(--white);
+      border-radius: 20px; padding: 36px;
+      box-shadow: 0 16px 48px rgba(0,0,0,.1); text-align: center;
+    }
+    .hero-card .ic  { font-size: 64px; margin-bottom: 14px; }
+    .hero-card h3   { font-size: 19px; font-weight: 700; margin-bottom: 8px; }
+    .hero-card p    { font-size: 13px; color: var(--muted); margin-bottom: 20px; line-height: 1.6; }
+    .avail { display: flex; align-items: center; justify-content: center; gap: 8px;
+      background: #f0fdf4; border: 1px solid #bbf7d0;
+      border-radius: 8px; padding: 10px;
+      font-size: 13px; font-weight: 600; color: #15803d; }
+    .gdot { width: 8px; height: 8px; background: #22c55e; border-radius: 50%; animation: pg 1.5s infinite; }
+
+    /* STATS */
+    .stats { display: grid; grid-template-columns: repeat(4,1fr); gap: 1px; background: var(--border); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .stat  { background: var(--white); padding: 30px; text-align: center; }
+    .stat-num { font-size: 34px; font-weight: 800; color: var(--blue); }
+    .stat-lbl { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+    /* SECTIONS */
+    section { padding: 76px 80px; }
+    .sec-tag { display: inline-block; background: #dbeafe; color: var(--blue); padding: 4px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 14px; }
+    .sec-title { font-size: 34px; font-weight: 800; margin-bottom: 10px; }
+    .sec-sub   { font-size: 16px; color: var(--muted); max-width: 520px; }
+
+    /* SERVICES */
+    #services { background: var(--white); }
+    .svc-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 22px; margin-top: 44px; }
+    .svc-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 26px; transition: all .2s; }
+    .svc-card:hover { border-color: var(--blue); box-shadow: 0 6px 20px rgba(26,86,219,.1); transform: translateY(-3px); }
+    .svc-ic    { font-size: 34px; margin-bottom: 12px; }
+    .svc-name  { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+    .svc-desc  { font-size: 13px; color: var(--muted); line-height: 1.6; margin-bottom: 10px; }
+    .svc-price { font-size: 13px; font-weight: 700; color: var(--blue); }
+
+    /* DOCTORS */
+    #doctors { background: var(--bg); }
+    .doc-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 24px; margin-top: 44px; }
+    .doc-card { background: var(--white); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; display: flex; gap: 18px; }
+    .doc-av   { width: 64px; height: 64px; flex-shrink: 0; border-radius: 50%; background: linear-gradient(135deg,#dbeafe,#bfdbfe); display: flex; align-items: center; justify-content: center; font-size: 28px; }
+    .doc-name { font-size: 17px; font-weight: 700; margin-bottom: 4px; }
+    .doc-spec { font-size: 12px; color: var(--blue); font-weight: 600; margin-bottom: 8px; }
+    .doc-sch  { font-size: 13px; color: var(--muted); line-height: 1.7; }
+
+    /* CONTACT */
+    #contact { background: var(--white); }
+    .con-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; margin-top: 44px; align-items: start; }
+    .con-item { display: flex; gap: 14px; margin-bottom: 22px; }
+    .con-ic   { width: 42px; height: 42px; flex-shrink: 0; background: #dbeafe; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+    .con-lbl  { font-size: 12px; color: var(--muted); }
+    .con-val  { font-size: 15px; font-weight: 600; margin-top: 2px; }
+    .cta-box  { background: linear-gradient(135deg,var(--blue),#3b82f6); border-radius: 18px; padding: 36px; color: #fff; text-align: center; }
+    .cta-box h3 { font-size: 22px; font-weight: 800; margin-bottom: 8px; }
+    .cta-box p  { font-size: 14px; opacity: .85; margin-bottom: 22px; }
+    .cta-btn { display: inline-flex; align-items: center; gap: 8px; padding: 13px 28px; background: #fff; color: var(--blue); border: none; border-radius: 9px; font-size: 15px; font-weight: 700; cursor: pointer; font-family: inherit; transition: all .2s; }
+    .cta-btn:hover { transform: scale(1.03); }
+
+    /* FOOTER */
+    footer { background: var(--text); color: #9ca3af; padding: 28px 80px; display: flex; align-items: center; justify-content: space-between; font-size: 13px; }
+    footer strong { color: #fff; }
+
+    /* ════════════════════════════
+       CHAT POPUP
+    ════════════════════════════ */
+    #overlay {
+      display: none; position: fixed; inset: 0; z-index: 999;
+      background: rgba(0,0,0,.55); backdrop-filter: blur(5px);
+      align-items: flex-end; justify-content: flex-end;
+      padding: 24px;
+    }
+    #overlay.open { display: flex; }
+
+    .chat-box {
+      width: 380px; height: 580px;
+      background: #1a1f36; border-radius: 20px;
+      display: flex; flex-direction: column;
+      box-shadow: 0 24px 64px rgba(0,0,0,.5);
+      animation: slideUp .3s cubic-bezier(.34,1.56,.64,1);
+      overflow: hidden;
+    }
+    @keyframes slideUp { from{transform:translateY(40px);opacity:0} to{transform:translateY(0);opacity:1} }
+
+    /* LANG SELECT */
+    #step-lang {
+      flex: 1; display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      padding: 32px 24px; text-align: center;
+    }
+    #step-lang .logo   { font-size: 52px; margin-bottom: 12px; }
+    #step-lang h2      { font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 4px; }
+    #step-lang .tagline{ font-size: 13px; color: #9ca3af; margin-bottom: 32px; }
+    #step-lang .prompt { font-size: 14px; color: #d1d5db; margin-bottom: 18px; }
+    .lang-row  { display: flex; gap: 14px; }
+    .lang-pill {
+      flex: 1; padding: 16px 10px;
+      border-radius: 14px; border: 2px solid #2e3a5c;
+      background: #242b45; color: #fff;
+      cursor: pointer; font-family: inherit;
+      font-size: 14px; font-weight: 600;
+      transition: all .2s;
+    }
+    .lang-pill:hover  { border-color: var(--blue); background: #1e3060; }
+    .lang-pill .flag  { font-size: 28px; display: block; margin-bottom: 6px; }
+
+    /* CHAT HEADER */
+    .chat-header {
+      background: #242b45; padding: 14px 16px;
+      display: flex; align-items: center; gap: 10px;
+      border-bottom: 1px solid #2e3a5c; flex-shrink: 0;
+    }
+    .agent-av {
+      width: 36px; height: 36px; border-radius: 50%;
+      background: linear-gradient(135deg,#1240a8,var(--blue));
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px; flex-shrink: 0;
+    }
+    .agent-name { font-size: 14px; font-weight: 700; color: #fff; }
+    .agent-role { font-size: 11px; color: #9ca3af; }
+    .close-btn  {
+      margin-left: auto; width: 30px; height: 30px;
+      background: #2e3a5c; border: none; border-radius: 50%;
+      color: #9ca3af; cursor: pointer; font-size: 16px;
+      display: flex; align-items: center; justify-content: center;
+      transition: all .2s;
+    }
+    .close-btn:hover { background: #dc2626; color: #fff; }
+
+    /* MESSAGES */
+    #messages {
+      flex: 1; overflow-y: auto;
+      padding: 16px; display: flex;
+      flex-direction: column; gap: 12px;
+    }
+    #messages::-webkit-scrollbar { width: 3px; }
+    #messages::-webkit-scrollbar-thumb { background: #2e3a5c; border-radius: 3px; }
+
+    .msg { display: flex; gap: 8px; max-width: 88%; }
+    .msg.agent { align-self: flex-start; }
+    .msg.user  { align-self: flex-end; flex-direction: row-reverse; }
+    .msg-av    { width: 28px; height: 28px; flex-shrink: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; }
+    .msg.agent .msg-av { background: linear-gradient(135deg,#1240a8,var(--blue)); }
+    .msg.user  .msg-av { background: #374151; }
+    .bubble {
+      padding: 10px 14px; border-radius: 14px;
+      font-size: 14px; line-height: 1.6;
+      font-family: 'Hind Siliguri','Inter',sans-serif;
+    }
+    .msg.agent .bubble { background: #242b45; color: #e5e7eb; border-top-left-radius: 4px; }
+    .msg.user  .bubble { background: var(--blue); color: #fff; border-top-right-radius: 4px; }
+
+    .typing-bubble {
+      align-self: flex-start; display: flex; gap: 8px;
+      align-items: center;
+    }
+    .dots { display: flex; gap: 4px; padding: 10px 14px; background: #242b45; border-radius: 14px; border-top-left-radius: 4px; }
+    .dots span { width: 6px; height: 6px; background: #6b7280; border-radius: 50%; animation: blink 1.2s infinite; }
+    .dots span:nth-child(2) { animation-delay: .2s; }
+    .dots span:nth-child(3) { animation-delay: .4s; }
+    @keyframes blink { 0%,80%,100%{opacity:.2} 40%{opacity:1} }
+
+    .saved-msg {
+      align-self: center;
+      background: #052e16; border: 1px solid #16a34a;
+      border-radius: 10px; padding: 9px 16px;
+      font-size: 13px; color: #4ade80;
+      font-family: 'Hind Siliguri','Inter',sans-serif;
+    }
+
+    /* INPUT */
+    .chat-input {
+      border-top: 1px solid #2e3a5c; padding: 12px;
+      display: flex; gap: 8px; flex-shrink: 0;
+    }
+    #msg-input {
+      flex: 1; background: #242b45; border: 1px solid #2e3a5c;
+      border-radius: 10px; padding: 10px 14px;
+      color: #e5e7eb; font-family: 'Hind Siliguri','Inter',sans-serif;
+      font-size: 14px; outline: none; transition: border .2s;
+      resize: none;
+    }
+    #msg-input:focus { border-color: var(--blue); }
+    #msg-input::placeholder { color: #4b5563; }
+    .send-btn {
+      width: 42px; height: 42px; flex-shrink: 0;
+      background: var(--blue); border: none; border-radius: 10px;
+      color: #fff; font-size: 18px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background .2s; align-self: flex-end;
+    }
+    .send-btn:hover { background: var(--blue-dk); }
+    .send-btn:disabled { background: #2e3a5c; cursor: not-allowed; }
+
+    #step-chat { display: none; flex-direction: column; flex: 1; overflow: hidden; }
+
+    @media(max-width:900px) {
+      nav { padding: 0 20px; }
+      .nav-links { display: none; }
+      .hero { padding: 40px 24px; flex-direction: column; }
+      .hero h1 { font-size: 34px; }
+      .hero-card { display: none; }
+      section { padding: 48px 24px; }
+      .svc-grid,.doc-grid,.con-grid,.stats { grid-template-columns: 1fr; }
+      footer { padding: 24px; flex-direction: column; gap: 6px; text-align: center; }
+      #overlay { padding: 0; align-items: flex-end; justify-content: center; }
+      .chat-box { width: 100%; border-bottom-left-radius: 0; border-bottom-right-radius: 0; height: 70vh; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <a class="nav-logo" href="#">
+    <span class="em">🦷</span>
+    <div><div class="name">Smile Dental Care</div><div class="sub">Dhanmondi 27, Dhaka</div></div>
+  </a>
+  <div class="nav-links">
+    <a href="#services">Services</a>
+    <a href="#doctors">Doctors</a>
+    <a href="#contact">Contact</a>
+  </div>
+  <button class="nav-cta" onclick="openChat()">💬 Book Appointment</button>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-text">
+    <div class="hero-badge">🏥 Dhaka's Trusted Dental Clinic</div>
+    <h1>Your <span>Smile</span><br>Is Our Priority</h1>
+    <p>Professional dental care with experienced specialists. Chat with our AI receptionist Mita to book your appointment instantly.</p>
+    <div class="hero-btns">
+      <button class="btn-primary" onclick="openChat()"><div class="dot"></div>💬 Chat & Book Now</button>
+      <a class="btn-outline" href="#services">View Services →</a>
+    </div>
+  </div>
+  <div class="hero-card">
+    <div class="ic">🤖</div>
+    <h3>AI Receptionist</h3>
+    <p>Chat with Mita in Bangla or English to book your appointment in minutes — available every day.</p>
+    <div class="avail"><div class="gdot"></div>Available 9 AM – 8 PM</div>
+  </div>
+</section>
+
+<!-- STATS -->
+<div class="stats">
+  <div class="stat"><div class="stat-num">5000+</div><div class="stat-lbl">Patients Treated</div></div>
+  <div class="stat"><div class="stat-num">10+</div><div class="stat-lbl">Years Experience</div></div>
+  <div class="stat"><div class="stat-num">2</div><div class="stat-lbl">Expert Doctors</div></div>
+  <div class="stat"><div class="stat-num">6</div><div class="stat-lbl">Dental Services</div></div>
+</div>
+
+<!-- SERVICES -->
+<section id="services">
+  <div class="sec-tag">Our Services</div>
+  <div class="sec-title">Comprehensive Dental Care</div>
+  <div class="sec-sub">From routine checkups to advanced procedures — we've got you covered.</div>
+  <div class="svc-grid">
+    <div class="svc-card"><div class="svc-ic">🔍</div><div class="svc-name">Dental Checkup</div><div class="svc-desc">Complete oral examination and X-rays to detect issues early.</div><div class="svc-price">৳300 – ৳500</div></div>
+    <div class="svc-card"><div class="svc-ic">✨</div><div class="svc-name">Scaling & Cleaning</div><div class="svc-desc">Professional teeth cleaning to remove plaque and tartar buildup.</div><div class="svc-price">৳800 – ৳1,200</div></div>
+    <div class="svc-card"><div class="svc-ic">🦷</div><div class="svc-name">Tooth Filling</div><div class="svc-desc">Restore damaged or decayed teeth with durable fillings.</div><div class="svc-price">৳500 – ৳1,500</div></div>
+    <div class="svc-card"><div class="svc-ic">🔧</div><div class="svc-name">Root Canal</div><div class="svc-desc">Pain-free treatment to save infected or severely damaged teeth.</div><div class="svc-price">৳3,000 – ৳6,000</div></div>
+    <div class="svc-card"><div class="svc-ic">💉</div><div class="svc-name">Tooth Extraction</div><div class="svc-desc">Safe and gentle removal of damaged or wisdom teeth.</div><div class="svc-price">৳500 – ৳1,000</div></div>
+    <div class="svc-card"><div class="svc-ic">😁</div><div class="svc-name">Dentures</div><div class="svc-desc">Custom-made artificial teeth for a confident, natural smile.</div><div class="svc-price">৳5,000 – ৳15,000</div></div>
+  </div>
+</section>
+
+<!-- DOCTORS -->
+<section id="doctors">
+  <div class="sec-tag">Our Doctors</div>
+  <div class="sec-title">Meet Our Specialists</div>
+  <div class="sec-sub">Experienced, caring professionals dedicated to your oral health.</div>
+  <div class="doc-grid">
+    <div class="doc-card"><div class="doc-av">👩‍⚕️</div><div><div class="doc-name">Dr. Rahela Khanam</div><div class="doc-spec">Dental Specialist (BDS, FCPS)</div><div class="doc-sch">📅 Mon, Wed, Fri<br>🕙 10:00 AM – 2:00 PM</div></div></div>
+    <div class="doc-card"><div class="doc-av">👨‍⚕️</div><div><div class="doc-name">Dr. Karim</div><div class="doc-spec">Pediatric Dentist (BDS)</div><div class="doc-sch">📅 Tue, Thu<br>🕓 4:00 PM – 8:00 PM</div></div></div>
+  </div>
+</section>
+
+<!-- CONTACT -->
+<section id="contact">
+  <div class="sec-tag">Contact Us</div>
+  <div class="sec-title">Get In Touch</div>
+  <div class="con-grid">
+    <div>
+      <div class="con-item"><div class="con-ic">📍</div><div><div class="con-lbl">Address</div><div class="con-val">Dhanmondi 27, Dhaka, Bangladesh</div></div></div>
+      <div class="con-item"><div class="con-ic">🕐</div><div><div class="con-lbl">Hours</div><div class="con-val">Sat–Fri: 9 AM – 8 PM (Closed Sunday)</div></div></div>
+      <div class="con-item"><div class="con-ic">📞</div><div><div class="con-lbl">Phone</div><div class="con-val">01XXXXXXXXX</div></div></div>
+    </div>
+    <div class="cta-box">
+      <h3>Book in 2 Minutes</h3>
+      <p>Chat with Mita, our AI receptionist, in Bangla or English to book your appointment instantly.</p>
+      <button class="cta-btn" onclick="openChat()">💬 Start Chat Now</button>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div>🦷 <strong>Smile Dental Care</strong> — Dhanmondi 27, Dhaka</div>
+  <div>© 2026 All rights reserved</div>
+</footer>
+
+<!-- CHAT POPUP -->
+<div id="overlay">
+  <div class="chat-box">
+
+    <!-- Step 1: Language -->
+    <div id="step-lang">
+      <div class="logo">🦷</div>
+      <h2>Smile Dental Care</h2>
+      <div class="tagline">AI Receptionist — Mita</div>
+      <div class="prompt">Choose your language / ভাষা বেছে নিন</div>
+      <div class="lang-row">
+        <button class="lang-pill" onclick="startChat('bn')"><span class="flag">🇧🇩</span>বাংলা</button>
+        <button class="lang-pill" onclick="startChat('en')"><span class="flag">🇬🇧</span>English</button>
+      </div>
+    </div>
+
+    <!-- Step 2: Chat -->
+    <div id="step-chat">
+      <div class="chat-header">
+        <div class="agent-av">🤖</div>
+        <div>
+          <div class="agent-name" id="agent-name">Mita</div>
+          <div class="agent-role" id="agent-role">AI Receptionist</div>
+        </div>
+        <button class="close-btn" onclick="closeChat()">✕</button>
+      </div>
+      <div id="messages"></div>
+      <div class="chat-input">
+        <textarea id="msg-input" rows="1" placeholder="Type here..."></textarea>
+        <button class="send-btn" id="send-btn" onclick="sendMsg()">➤</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+let LANG = "bn";
+let SID  = "s_" + Math.random().toString(36).slice(2);
+let busy = false;
+
+const T = {
+  bn: {
+    name: "মিতা", role: "AI রিসেপশনিস্ট",
+    placeholder: "বাংলায় লিখুন...",
+    welcome: "আস্সালামু আলাইকুম! স্মাইল ডেন্টাল কেয়ারে স্বাগতম। আমি মিতা। কীভাবে সাহায্য করতে পারি? 😊",
+    saved: "✅ আপনার অ্যাপয়েন্টমেন্ট নিশ্চিত হয়েছে!",
+  },
+  en: {
+    name: "Mita", role: "AI Receptionist",
+    placeholder: "Type your message...",
+    welcome: "Hello! Welcome to Smile Dental Care. I'm Mita, your AI receptionist. How can I help you today? 😊",
+    saved: "✅ Your appointment has been confirmed!",
+  }
+};
+
+function openChat() {
+  document.getElementById("overlay").classList.add("open");
+  document.getElementById("step-lang").style.display = "flex";
+  document.getElementById("step-chat").style.display = "none";
+}
+
+function closeChat() {
+  document.getElementById("overlay").classList.remove("open");
+}
+
+document.getElementById("overlay").addEventListener("click", e => {
+  if (e.target === document.getElementById("overlay")) closeChat();
+});
+
+async function startChat(lang) {
+  LANG = lang;
+  const t = T[lang];
+  document.getElementById("step-lang").style.display = "none";
+  document.getElementById("step-chat").style.display = "flex";
+  document.getElementById("agent-name").textContent  = t.name;
+  document.getElementById("agent-role").textContent  = t.role;
+  document.getElementById("msg-input").placeholder   = t.placeholder;
+  document.getElementById("messages").innerHTML      = "";
+
+  await fetch("/reset", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({session_id: SID})
+  });
+
+  addMsg("agent", t.welcome);
+}
+
+function addMsg(role, text) {
+  const box  = document.getElementById("messages");
+  const wrap = document.createElement("div");
+  wrap.className = `msg ${role}`;
+  const av  = document.createElement("div");
+  av.className = "msg-av";
+  av.textContent = role === "agent" ? "🤖" : "👤";
+  const bub = document.createElement("div");
+  bub.className = "bubble";
+  bub.textContent = text;
+  wrap.appendChild(av);
+  wrap.appendChild(bub);
+  box.appendChild(wrap);
+  box.scrollTop = box.scrollHeight;
+}
+
+function addSaved() {
+  const box = document.getElementById("messages");
+  const el  = document.createElement("div");
+  el.className   = "saved-msg";
+  el.textContent = T[LANG].saved;
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+}
+
+function showTyping() {
+  const box = document.getElementById("messages");
+  const el  = document.createElement("div");
+  el.className = "typing-bubble"; el.id = "typing";
+  el.innerHTML = `<div class="msg-av" style="background:linear-gradient(135deg,#1240a8,#1a56db);width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px">🤖</div><div class="dots"><span></span><span></span><span></span></div>`;
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+}
+
+function hideTyping() {
+  const el = document.getElementById("typing");
+  if (el) el.remove();
+}
+
+async function sendMsg() {
+  if (busy) return;
+  const input = document.getElementById("msg-input");
+  const text  = input.value.trim();
+  if (!text) return;
+
+  input.value = "";
+  input.style.height = "auto";
+  addMsg("user", text);
+
+  busy = true;
+  document.getElementById("send-btn").disabled = true;
+  showTyping();
+
+  try {
+    const res  = await fetch("/chat", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({session_id:SID, message:text, lang:LANG})
+    });
+    const data = await res.json();
+    hideTyping();
+    addMsg("agent", data.reply);
+    if (data.appointment_saved) addSaved();
+  } catch(e) {
+    hideTyping();
+    addMsg("agent", LANG === "bn" ? "সমস্যা হয়েছে। আবার চেষ্টা করুন।" : "Something went wrong. Please try again.");
+  }
+
+  busy = false;
+  document.getElementById("send-btn").disabled = false;
+  input.focus();
+}
+
+// Enter to send, Shift+Enter for new line
+document.getElementById("msg-input").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+});
+
+// Auto-resize textarea
+document.getElementById("msg-input").addEventListener("input", function() {
+  this.style.height = "auto";
+  this.style.height = Math.min(this.scrollHeight, 100) + "px";
+});
+</script>
+</body>
+</html>

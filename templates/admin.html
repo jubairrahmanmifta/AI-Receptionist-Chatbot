@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Appointments — Smile Dental Admin</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Hind+Siliguri:wght@400;500;600&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', sans-serif; background: #f0f4ff; min-height: 100vh; }
+    .topbar { background: #1a1f36; color: #fff; padding: 0 32px; height: 60px; display: flex; align-items: center; gap: 14px; }
+    .topbar h1  { font-size: 16px; font-weight: 700; }
+    .topbar .sub{ font-size: 12px; color: #9ca3af; }
+    .topbar a   { margin-left: auto; padding: 7px 18px; background: transparent; color: #9ca3af; border: 1px solid #374151; border-radius: 7px; font-size: 13px; text-decoration: none; transition: all .2s; }
+    .topbar a:hover { border-color: #dc2626; color: #dc2626; }
+    .nav-tabs { background: #fff; border-bottom: 1px solid #e5e7eb; padding: 0 32px; display: flex; }
+    .nav-tab { padding: 14px 20px; font-size: 14px; font-weight: 500; color: #6b7280; text-decoration: none; border-bottom: 2px solid transparent; transition: all .2s; }
+    .nav-tab:hover { color: #1a56db; }
+    .nav-tab.active { color: #1a56db; border-bottom-color: #1a56db; }
+    .main { max-width: 1100px; margin: 0 auto; padding: 28px 24px; }
+    .stats-row { display: grid; grid-template-columns: repeat(3,1fr); gap: 16px; margin-bottom: 24px; }
+    .stat-card { background: #fff; border-radius: 12px; padding: 20px; border: 1px solid #e5e7eb; }
+    .stat-card .num { font-size: 30px; font-weight: 800; color: #1a56db; }
+    .stat-card .lbl { font-size: 13px; color: #6b7280; margin-top: 3px; }
+    .table-card { background: #fff; border-radius: 14px; border: 1px solid #e5e7eb; overflow: hidden; }
+    .table-hdr  { padding: 18px 24px; border-bottom: 1px solid #e5e7eb; display: flex; align-items: center; justify-content: space-between; }
+    .table-hdr h2 { font-size: 15px; font-weight: 700; }
+    .table-hdr p  { font-size: 13px; color: #6b7280; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th { background: #f9fafb; padding: 11px 18px; text-align: left; font-size: 11px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid #e5e7eb; }
+    tbody tr { border-bottom: 1px solid #f3f4f6; transition: background .1s; }
+    tbody tr:hover { background: #fafbff; }
+    tbody tr:last-child { border: none; }
+    td { padding: 13px 18px; font-size: 14px; font-family: 'Hind Siliguri','Inter',sans-serif; }
+    .td-name  { font-weight: 600; color: #1a1f36; }
+    .td-phone { color: #1a56db; font-weight: 500; }
+    .badge    { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+    .badge-date { background: #eff6ff; color: #1a56db; }
+    .badge-time { background: #f0fdf4; color: #15803d; }
+    .td-saved { font-size: 12px; color: #9ca3af; }
+    .del-btn { padding: 5px 12px; background: transparent; color: #dc2626; border: 1px solid #fecaca; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: inherit; transition: all .2s; }
+    .del-btn:hover { background: #fef2f2; border-color: #dc2626; }
+    .empty { text-align: center; padding: 56px 20px; }
+    .empty .ic { font-size: 44px; margin-bottom: 12px; }
+    .empty p   { font-size: 15px; color: #9ca3af; }
+  </style>
+</head>
+<body>
+<div class="topbar">
+  <span>🦷</span>
+  <h1>Smile Dental Care</h1>
+  <span class="sub">/ Admin</span>
+  <a href="/admin/logout">Logout</a>
+</div>
+<div class="nav-tabs">
+  <a class="nav-tab active" href="/admin">📋 Appointments</a>
+  <a class="nav-tab" href="/admin/config">⚙️ Settings</a>
+</div>
+<div class="main">
+  {% set total = appointments | length %}
+  {% set today_list = appointments | selectattr('date', 'equalto', now_date) | list %}
+  {% set upcoming   = appointments | selectattr('date', 'ge', now_date) | list %}
+  <div class="stats-row">
+    <div class="stat-card"><div class="num">{{ total }}</div><div class="lbl">Total Appointments</div></div>
+    <div class="stat-card"><div class="num">{{ today_list | length }}</div><div class="lbl">Today</div></div>
+    <div class="stat-card"><div class="num">{{ upcoming | length }}</div><div class="lbl">Upcoming</div></div>
+  </div>
+  <div class="table-card">
+    <div class="table-hdr">
+      <div><h2>📋 All Appointments</h2><p>Newest first · {{ total }} record{{ 's' if total != 1 }}</p></div>
+    </div>
+    {% if appointments %}
+    <table>
+      <thead><tr><th>#</th><th>Patient</th><th>Phone</th><th>Problem</th><th>Date</th><th>Time</th><th>Saved At</th><th></th></tr></thead>
+      <tbody>
+      {% for a in appointments %}
+        <tr>
+          <td style="color:#9ca3af;font-size:12px">{{ loop.index }}</td>
+          <td class="td-name">{{ a.name or '—' }}</td>
+          <td class="td-phone">{{ a.phone or '—' }}</td>
+          <td>{{ a.problem or '—' }}</td>
+          <td><span class="badge badge-date">📅 {{ a.date or '—' }}</span></td>
+          <td><span class="badge badge-time">🕐 {{ a.time or '—' }}</span></td>
+          <td class="td-saved">{{ a.saved_at[:16].replace('T',' ') if a.saved_at else '—' }}</td>
+          <td>
+            <form method="POST" action="/admin/delete/{{ loop.index0 }}" onsubmit="return confirm('Delete this appointment?')">
+              <button class="del-btn" type="submit">🗑</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty"><div class="ic">📭</div><p>No appointments yet.</p></div>
+    {% endif %}
+  </div>
+</div>
+</body>
+</html>
