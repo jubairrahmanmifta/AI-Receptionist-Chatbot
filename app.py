@@ -9,6 +9,8 @@ from flask import (
 )
 import requests
 
+import db
+
 # Load variables from a local .env file if python-dotenv is available.
 # This is optional — you can also just export the variables in your shell.
 try:
@@ -22,8 +24,9 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
 
 # ─── FILES ─────────────────────────────────────────────────────────────────────
-CONFIG_FILE       = "config.json"
-APPOINTMENTS_FILE = "appointments.json"
+# Only secrets/API config stay in a JSON file (gitignored). Everything dynamic
+# — settings, doctors, services, appointments, admins — lives in SQLite (db.py).
+CONFIG_FILE = "config.json"
 
 # ─── LOAD CONFIG ───────────────────────────────────────────────────────────────
 # Environment variables take priority; config.json is the fallback (and is
@@ -48,6 +51,11 @@ def load_config():
         if value:
             cfg[key] = value
     return cfg
+
+def save_config(cfg):
+    """Write the local, gitignored config.json (used by /admin/config)."""
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 def get_cfg(key):
     return load_config().get(key, "")
@@ -120,16 +128,31 @@ SAVE_APPOINTMENT:{"name":"name","phone":"phone","problem":"problem","date":"YYYY
 # ─── CONVERSATION STORE ────────────────────────────────────────────────────────
 conversations = {}  # session_id -> list of messages
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# ─── DATABASE INIT ─────────────────────────────────────────────────────────────
+# Creates clinic.db (if needed), seeds clinic data from the prompts above,
+# seeds an admin account, and migrates any legacy appointments.json.
+# Set SKIP_DB_INIT=1 to skip this (used for tooling/preview).
+if os.environ.get("SKIP_DB_INIT") != "1":
+    _cfg = load_config()
+    db.init_db(
+        SYSTEM_PROMPT_BN,
+        SYSTEM_PROMPT_EN,
+        ai_model=_cfg.get("openrouter_model") or "openrouter/auto",
+        admin_username=_cfg.get("admin_username"),
+        admin_password=_cfg.get("admin_password"),
+    )
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+def _public_appt(appt):
+    """Shape an appointment dict like the old JSON records (for /chat output)."""
+    return {
+        "name":    appt.get("patient_name"),
+        "phone":   appt.get("phone"),
+        "problem": appt.get("notes"),
+        "date":    appt.get("date"),
+        "time":    appt.get("time"),
+        "saved_at": appt.get("created_at"),
+    }
 
 # ─── AI CHAT ──────────────────────────────────────────────────────────────────
 def chat_with_ai(session_id, user_message, lang="bn"):
@@ -225,11 +248,16 @@ def chat():
     if "SAVE_APPOINTMENT:" in reply:
         try:
             raw  = reply.split("SAVE_APPOINTMENT:")[1].strip().splitlines()[0]
-            appt = json.loads(raw)
-            appt["saved_at"] = datetime.datetime.now().isoformat()
-            appts = load_json(APPOINTMENTS_FILE, [])
-            appts.append(appt)
-            save_json(APPOINTMENTS_FILE, appts)
+            data = json.loads(raw)
+            appt_id = db.create_appointment(
+                patient_name=data.get("name"),
+                phone=data.get("phone"),
+                date=data.get("date"),
+                time=data.get("time"),
+                notes=data.get("problem"),
+                language=lang,
+            )
+            appt  = _public_appt(db.get_appointment(appt_id))
             saved = True
         except Exception as e:
             print(f"[Appointment save error] {e}")
@@ -256,10 +284,11 @@ def login_required(f):
 def admin_login():
     error = None
     if request.method == "POST":
-        cfg = load_config()
-        if (request.form.get("username") == cfg.get("admin_username") and
-                request.form.get("password") == cfg.get("admin_password")):
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if db.verify_admin(username, password):
             session["admin_logged_in"] = True
+            session["admin_username"] = username
             return redirect(url_for("admin_panel"))
         error = "Invalid username or password."
     return render_template("admin_login.html", error=error)
@@ -272,18 +301,14 @@ def admin_logout():
 @app.route("/admin")
 @login_required
 def admin_panel():
-    appts = list(reversed(load_json(APPOINTMENTS_FILE, [])))
+    appts = db.list_appointments()
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     return render_template("admin.html", appointments=appts, now_date=today)
 
-@app.route("/admin/delete/<int:idx>", methods=["POST"])
+@app.route("/admin/delete/<int:appt_id>", methods=["POST"])
 @login_required
-def admin_delete(idx):
-    appts    = load_json(APPOINTMENTS_FILE, [])
-    real_idx = len(appts) - 1 - idx
-    if 0 <= real_idx < len(appts):
-        appts.pop(real_idx)
-        save_json(APPOINTMENTS_FILE, appts)
+def admin_delete(appt_id):
+    db.delete_appointment(appt_id)
     return redirect(url_for("admin_panel"))
 
 # ─── CONFIG API (for live status check on settings page) ──────────────────────
@@ -295,13 +320,20 @@ def admin_config():
         cfg = load_config()
         cfg["openrouter_api_key"] = request.form.get("api_key", "").strip()
         cfg["openrouter_model"]   = request.form.get("model", "").strip()
-        cfg["admin_username"]     = request.form.get("admin_username", "").strip()
-        new_pass = request.form.get("admin_password", "").strip()
-        if new_pass:
-            cfg["admin_password"] = new_pass
-        save_json(CONFIG_FILE, cfg)
+        save_config(cfg)
+        db.set_setting("ai_model", cfg["openrouter_model"])
+
+        # Admin credentials live in SQLite as a hash.
+        current = db.list_admins()
+        if current:
+            admin_id = current[0]["id"]
+            new_username = request.form.get("admin_username", "").strip() or None
+            new_pass     = request.form.get("admin_password", "").strip() or None
+            db.update_admin(admin_id, username=new_username, password=new_pass)
         msg = "Settings saved!"
     cfg = load_config()
+    admins = db.list_admins()
+    cfg["admin_username"] = admins[0]["username"] if admins else ""
     return render_template("admin_config.html", cfg=cfg, msg=msg)
 
 if __name__ == "__main__":

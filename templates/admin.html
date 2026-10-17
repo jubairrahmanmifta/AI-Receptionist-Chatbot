@@ -76,14 +76,14 @@
       {% for a in appointments %}
         <tr>
           <td style="color:#9ca3af;font-size:12px">{{ loop.index }}</td>
-          <td class="td-name">{{ a.name or '—' }}</td>
+          <td class="td-name">{{ a.patient_name or '—' }}</td>
           <td class="td-phone">{{ a.phone or '—' }}</td>
-          <td>{{ a.problem or '—' }}</td>
+          <td>{{ a.notes or '—' }}</td>
           <td><span class="badge badge-date">📅 {{ a.date or '—' }}</span></td>
           <td><span class="badge badge-time">🕐 {{ a.time or '—' }}</span></td>
-          <td class="td-saved">{{ a.saved_at[:16].replace('T',' ') if a.saved_at else '—' }}</td>
+          <td class="td-saved">{{ a.created_at[:16].replace('T',' ') if a.created_at else '—' }}</td>
           <td>
-            <form method="POST" action="/admin/delete/{{ loop.index0 }}" onsubmit="return confirm('Delete this appointment?')">
+            <form method="POST" action="/admin/delete/{{ a.id }}" onsubmit="return confirm('Delete this appointment?')">
               <button class="del-btn" type="submit">🗑</button>
             </form>
           </td>

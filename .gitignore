@@ -1,5 +1,7 @@
 config.json
 appointments.json
+appointments.json.migrated
+clinic.db
 venv/
 __pycache__/
 *.pyc

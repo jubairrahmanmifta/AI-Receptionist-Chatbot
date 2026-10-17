@@ -31,10 +31,11 @@ cp config.example.json config.json
 ```
 
 Environment variables take priority over `config.json`. The `/admin/config`
-page still reads/writes the local `config.json`.
+page still reads/writes the local `config.json` for the API key/model. Admin
+credentials are stored hashed in SQLite (see below).
 
-> ⚠️ `config.json`, `appointments.json`, `venv/`, `__pycache__/`, `*.pyc`, and
-> `.env` are gitignored. Never commit real secrets.
+> ⚠️ `config.json`, `appointments.json`, `clinic.db`, `venv/`, `__pycache__/`,
+> `*.pyc`, and `.env` are gitignored. Never commit real secrets.
 
 ### 2. Install
 ```bash
@@ -48,6 +49,11 @@ pip install -r requirements.txt
 python app.py
 ```
 
+On first run the app creates `clinic.db`, seeds the clinic settings, doctors,
+schedules and services, seeds one admin account from your env/config, and
+migrates any legacy `appointments.json` (renaming it to
+`appointments.json.migrated`).
+
 ## URLs
 - Website  : http://localhost:5000
 - Admin    : http://localhost:5000/admin  (username/password from your config or env)
@@ -56,11 +62,12 @@ python app.py
 ## File structure
 ```
 dental_v4/
-├── app.py              ← Main server
+├── app.py              ← Flask routes / main server
+├── db.py               ← All SQLite access + schema/seed/migration
+├── clinic.db           ← SQLite database (gitignored, auto-created)
 ├── config.example.json ← Template for config.json (safe to commit)
-├── config.json         ← Your real config (gitignored)
+├── config.json         ← Your real secrets (gitignored)
 ├── requirements.txt    ← flask + requests + python-dotenv
-├── appointments.json   ← Auto-created when first appointment saved
 └── templates/
     ├── index.html          ← Main dental website + chat popup
     ├── admin_login.html    ← Admin login
