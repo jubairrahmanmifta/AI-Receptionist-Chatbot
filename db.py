@@ -12,11 +12,11 @@ string formatting.
 """
 
 import os
-import re
 import json
 import sqlite3
 import datetime
 from contextlib import contextmanager
+from zoneinfo import ZoneInfo
 
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -24,6 +24,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 DB_FILE = "clinic.db"
 APPOINTMENTS_JSON = "appointments.json"
 APPOINTMENTS_MIGRATED = "appointments.json.migrated"
+
+TZ_DHAKA = ZoneInfo("Asia/Dhaka")
 
 
 # ─── CONNECTION ───────────────────────────────────────────────────────────────
@@ -34,6 +36,7 @@ def _connect():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -44,14 +47,53 @@ def _connect():
         conn.close()
 
 
+@contextmanager
+def _connect_tx():
+    """Connection inside an immediate write transaction (atomic booking)."""
+    conn = sqlite3.connect(DB_FILE, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
 def _now():
-    """Return the current local timestamp as an ISO-8601 string."""
-    return datetime.datetime.now().isoformat()
+    """Return the current Asia/Dhaka timestamp as an ISO-8601 string."""
+    return dhaka_now().isoformat()
+
+
+def dhaka_now():
+    """Return the current datetime in the Asia/Dhaka timezone."""
+    return datetime.datetime.now(TZ_DHAKA)
+
+
+def dhaka_today():
+    """Return today's date in Asia/Dhaka as a ``datetime.date``."""
+    return dhaka_now().date()
 
 
 def _rows_to_dicts(rows):
     """Convert a list of ``sqlite3.Row`` objects into plain dicts."""
     return [dict(r) for r in rows]
+
+
+def _to_minutes(hhmm):
+    """Convert 'HH:MM' to minutes past midnight."""
+    hh, mm = hhmm.split(":")
+    return int(hh) * 60 + int(mm)
+
+
+def _from_minutes(minutes):
+    """Convert minutes past midnight to 'HH:MM'."""
+    return "%02d:%02d" % divmod(minutes, 60)
 
 
 # ─── SCHEMA ───────────────────────────────────────────────────────────────────
@@ -87,6 +129,7 @@ CREATE TABLE IF NOT EXISTS services (
     name_en          TEXT,
     name_bn          TEXT,
     price            REAL,
+    price_max        REAL,
     duration_minutes INTEGER,
     active           INTEGER DEFAULT 1
 );
@@ -102,6 +145,7 @@ CREATE TABLE IF NOT EXISTS appointments (
     status       TEXT DEFAULT 'pending',
     notes        TEXT,
     language     TEXT,
+    session_id   TEXT,
     created_at   TEXT,
     updated_at   TEXT
 );
@@ -131,253 +175,158 @@ def _create_tables():
         conn.executescript(SCHEMA)
 
 
-# ─── SEED EXTRACTION (from the hardcoded system prompts) ──────────────────────
+# ─── SEED DATA (used only to initialise a brand-new database) ─────────────────
 
-_BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
-
-_EN_WEEKDAYS = {
-    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
-}
-_BN_WEEKDAYS = {
-    "সোম": 0, "মঙ্গল": 1, "বুধ": 2, "বৃহস্পতি": 3,
-    "শুক্র": 4, "শনি": 5, "রবিবার": 6, "রবি": 6,
-}
-
-
-def _en_hour(hour, meridiem):
-    """Convert a 12-hour English hour + AM/PM to a 24-hour integer."""
-    hour = int(hour)
-    meridiem = meridiem.upper()
-    if meridiem == "PM" and hour != 12:
-        hour += 12
-    if meridiem == "AM" and hour == 12:
-        hour = 0
-    return hour
-
-
-def _en_time(text):
-    """Parse '10 AM' / '2 PM' into 'HH:MM'."""
-    m = re.search(r"(\d{1,2})\s*(AM|PM)", text, re.IGNORECASE)
-    if not m:
-        return None
-    return "%02d:00" % _en_hour(m.group(1), m.group(2))
-
-
-def _bn_period_hour(period, hour):
-    """Convert a Bengali period word + hour to a 24-hour integer."""
-    hour = int(hour.translate(_BN_DIGITS))
-    if period in ("সকাল",):            # morning
-        return hour
-    if period in ("দুপুর",):           # noon
-        return 12 if hour == 12 else hour + 12
-    if period in ("বিকাল", "বিকেল"):    # afternoon
-        return 12 if hour == 12 else hour + 12
-    if period in ("সন্ধ্যা", "রাত"):    # evening / night
-        return 0 if hour == 12 else hour + 12
-    return hour
-
-
-def _bn_time(text):
-    """Parse 'সকাল ১০টা' / 'বিকাল ৪টা' into 'HH:MM'."""
-    m = re.search(r"(সকাল|দুপুর|বিকাল|বিকেল|সন্ধ্যা|রাত)\s*([০-৯]+)\s*টা", text)
-    if not m:
-        return None
-    return "%02d:00" % _bn_period_hour(m.group(1), m.group(2))
-
-
-def _en_weekdays(text):
-    """Parse 'Mon, Wed, Fri' into [0, 2, 4]."""
-    days = []
-    for token in re.split(r"[,\s]+", text.strip()):
-        key = token[:3].lower()
-        if key in _EN_WEEKDAYS:
-            days.append(_EN_WEEKDAYS[key])
-    return days
-
-
-def _bn_weekdays(text):
-    """Parse 'সোম, বুধ, শুক্র' into [0, 2, 4]."""
-    days = []
-    for token in re.split(r"[,\s]+", text.strip()):
-        for name, idx in _BN_WEEKDAYS.items():
-            if token == name:
-                days.append(idx)
-                break
-    return days
-
-
-def _parse_doctors_en(prompt):
-    """Extract doctor dicts (name/specialty/schedule) from the English prompt."""
-    doctors = []
-    row_re = re.compile(
-        r"^-\s*(Dr\.\s*.+?)\s*\((.+?)\):\s*(.+?)\s*[—–-]\s*(.+)$",
-        re.MULTILINE,
-    )
-    for m in row_re.finditer(prompt):
-        days = _en_weekdays(m.group(3))
-        start = _en_time(m.group(4))
-        end = _en_time(m.group(4).split("to")[-1] if "to" in m.group(4) else m.group(4))
-        doctors.append({
-            "name": m.group(1).strip(),
-            "specialty": m.group(2).strip(),
-            "weekdays": days,
-            "start": start,
-            "end": end,
-        })
-    return doctors
-
-
-def _parse_doctors_bn(prompt):
-    """Extract doctor dicts (name/specialty/schedule) from the Bengali prompt."""
-    doctors = []
-    row_re = re.compile(
-        r"^-\s*(ডা\.\s*.+?)\s*\((.+?)\):\s*(.+?)\s*[—–-]\s*(.+)$",
-        re.MULTILINE,
-    )
-    for m in row_re.finditer(prompt):
-        days = _bn_weekdays(m.group(3))
-        parts = re.split(r"[—–]", m.group(4))
-        start = _bn_time(parts[0]) if parts else None
-        end = _bn_time(parts[-1]) if len(parts) > 1 else None
-        doctors.append({
-            "name": m.group(1).strip(),
-            "specialty": m.group(2).strip(),
-            "weekdays": days,
-            "start": start,
-            "end": end,
-        })
-    return doctors
-
-
-def _parse_services_en(prompt):
-    """Extract service names + starting prices from the English prompt."""
-    services = []
-    block = prompt.split("Services:")[-1]
-    for m in re.finditer(r"([A-Za-z][A-Za-z ]*?)\s+([\d,]+)\s*[–-]\s*[\d,]+\s*BDT", block):
-        services.append({"name": m.group(1).strip(), "price": float(m.group(2).replace(",", ""))})
-    return services
-
-
-def _parse_services_bn(prompt):
-    """Extract service names + starting prices from the Bengali prompt."""
-    services = []
-    block = prompt.split("সেবা ও খরচ:")[-1]
-    for m in re.finditer(r"([^|]+?)\s+([০-৯]+)\s*[–-]\s*[০-৯]+\s*৳", block):
-        services.append({
-            "name": m.group(1).strip(),
-            "price": float(m.group(2).translate(_BN_DIGITS)),
-        })
-    return services
-
-
-def extract_seed(prompt_bn, prompt_en, ai_model="openrouter/auto"):
-    """Parse the hardcoded clinic data out of the two system prompts.
-
-    Returns a dict with ``settings`` (key -> value), ``doctors`` (list, each
-    with a ``schedule`` list) and ``services`` (list). Prices are stored as the
-    *starting* value of the range shown in the prompt; durations default to 30
-    minutes because the prompts do not specify them.
-    """
-    settings = {}
-
-    m = re.search(r"-\s*Name:\s*(.+?)\s*\|\s*Address:\s*(.+)", prompt_en)
-    if m:
-        settings["clinic_name"] = m.group(1).strip()
-        settings["address"] = m.group(2).strip()
-    m = re.search(r"-\s*নাম:\s*(.+?)\s*\|\s*ঠিকানা:\s*(.+)", prompt_bn)
-    if m:
-        settings["clinic_name_bn"] = m.group(1).strip()
-        settings["address_bn"] = m.group(2).strip()
-
-    m = re.search(r"-\s*Hours:\s*(.+)", prompt_en)
-    if m:
-        settings["opening_hours"] = m.group(1).strip()
-    m = re.search(r"-\s*সময়:\s*(.+)", prompt_bn)
-    if m:
-        settings["opening_hours_bn"] = m.group(1).strip()
-
-    m = re.search(r"You are\s+(\w+)\s*[—–-]", prompt_en)
-    if m:
-        settings["persona_name"] = m.group(1).strip()
-    m = re.search(r"তুমি\s+(\S+?)\s*[—–-]", prompt_bn)
-    if m:
-        settings["persona_name_bn"] = m.group(1).strip()
-
-    settings["phone"] = ""
-    settings["welcome_en"] = ""
-    settings["welcome_bn"] = ""
-    settings["extra_info_en"] = ""
-    settings["extra_info_bn"] = ""
-    settings["ai_model"] = ai_model
-
-    doctors_en = _parse_doctors_en(prompt_en)
-    doctors_bn = _parse_doctors_bn(prompt_bn)
-    doctors = []
-    for i, d_en in enumerate(doctors_en):
-        d_bn = doctors_bn[i] if i < len(doctors_bn) else {}
-        schedule = []
-        for weekday in d_en["weekdays"] or d_bn.get("weekdays", []):
-            if d_en.get("start") and d_en.get("end"):
-                schedule.append({
-                    "weekday": weekday,
-                    "start_time": d_en["start"],
-                    "end_time": d_en["end"],
-                })
-            elif d_bn.get("start") and d_bn.get("end"):
-                schedule.append({
-                    "weekday": weekday,
-                    "start_time": d_bn["start"],
-                    "end_time": d_bn["end"],
-                })
-        doctors.append({
-            "name_en": d_en["name"],
-            "name_bn": d_bn.get("name", ""),
-            "specialty_en": d_en["specialty"],
-            "specialty_bn": d_bn.get("specialty", ""),
+# Prices are stored as a range: ``price`` is the minimum and ``price_max`` the
+# maximum. A service with a single fixed price has ``price_max = None``.
+SEED_DATA = {
+    "settings": {
+        "clinic_name": "Smile Dental Care",
+        "clinic_name_bn": "স্মাইল ডেন্টাল কেয়ার",
+        "address": "Dhanmondi 27, Dhaka",
+        "address_bn": "ধানমন্ডি ২৭, ঢাকা",
+        "phone": "",
+        "opening_hours": "9 AM — 8 PM (Closed Sundays)",
+        "opening_hours_bn": "সকাল ৯টা — রাত ৮টা (রবিবার বন্ধ)",
+        "persona_name": "Mita",
+        "persona_name_bn": "মিতা",
+        "welcome_en": "",
+        "welcome_bn": "",
+        "extra_info_en": "",
+        "extra_info_bn": "",
+        "ai_model": "openrouter/auto",
+    },
+    "doctors": [
+        {
+            "name_en": "Dr. Rahela Khanam",
+            "name_bn": "ডা. রাহেলা খানম",
+            "specialty_en": "Dental Specialist",
+            "specialty_bn": "দাঁতের বিশেষজ্ঞ",
             "bio_en": "",
             "bio_bn": "",
             "slot_minutes": 30,
             "active": 1,
-            "schedule": schedule,
-        })
-
-    services_en = _parse_services_en(prompt_en)
-    services_bn = _parse_services_bn(prompt_bn)
-    services = []
-    for i, s_en in enumerate(services_en):
-        s_bn = services_bn[i] if i < len(services_bn) else {}
-        services.append({
-            "name_en": s_en["name"],
-            "name_bn": s_bn.get("name", ""),
-            "price": s_en["price"],
-            "duration_minutes": 30,
+            "schedule": [
+                {"weekday": 0, "start_time": "10:00", "end_time": "14:00"},
+                {"weekday": 2, "start_time": "10:00", "end_time": "14:00"},
+                {"weekday": 4, "start_time": "10:00", "end_time": "14:00"},
+            ],
+        },
+        {
+            "name_en": "Dr. Karim",
+            "name_bn": "ডা. করিম সাহেব",
+            "specialty_en": "Pediatric Dentist",
+            "specialty_bn": "শিশু দন্ত বিশেষজ্ঞ",
+            "bio_en": "",
+            "bio_bn": "",
+            "slot_minutes": 30,
             "active": 1,
+            "schedule": [
+                {"weekday": 1, "start_time": "16:00", "end_time": "20:00"},
+                {"weekday": 3, "start_time": "16:00", "end_time": "20:00"},
+            ],
+        },
+    ],
+    "services": [
+        {"name_en": "Checkup", "name_bn": "চেকআপ", "price": 300.0,
+         "price_max": 500.0, "duration_minutes": 30, "active": 1},
+        {"name_en": "Scaling", "name_bn": "স্কেলিং", "price": 800.0,
+         "price_max": 1200.0, "duration_minutes": 30, "active": 1},
+        {"name_en": "Filling", "name_bn": "ফিলিং", "price": 500.0,
+         "price_max": 1500.0, "duration_minutes": 30, "active": 1},
+        {"name_en": "Root Canal", "name_bn": "রুট ক্যানেল", "price": 3000.0,
+         "price_max": 6000.0, "duration_minutes": 30, "active": 1},
+        {"name_en": "Extraction", "name_bn": "দাঁত তোলা", "price": 500.0,
+         "price_max": 1000.0, "duration_minutes": 30, "active": 1},
+        {"name_en": "Denture", "name_bn": "ডেনচার", "price": 5000.0,
+         "price_max": 15000.0, "duration_minutes": 30, "active": 1},
+    ],
+}
+
+# Original price ranges from the old hardcoded prompts. Used once to backfill
+# ``price_max`` on databases created before that column existed.
+OLD_PRICE_RANGES = {
+    s["name_en"]: (s["price"], s["price_max"]) for s in SEED_DATA["services"]
+}
+
+
+# ─── SCHEMA MIGRATIONS (idempotent, check columns before altering) ────────────
+
+def _migrate_columns():
+    """Add columns introduced after the first release (safe to re-run)."""
+    with _connect() as conn:
+        service_cols = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+        if "price_max" not in service_cols:
+            conn.execute("ALTER TABLE services ADD COLUMN price_max REAL")
+            print("[db] Added column services.price_max")
+        appt_cols = {r["name"] for r in conn.execute("PRAGMA table_info(appointments)")}
+        if "session_id" not in appt_cols:
+            conn.execute("ALTER TABLE appointments ADD COLUMN session_id TEXT")
+            print("[db] Added column appointments.session_id")
+
+
+def preview_price_backfill():
+    """Return the old range vs proposed price/price_max for every service.
+
+    Used to review the backfill before it is applied.
+    """
+    out = []
+    for s in list_services():
+        rng = OLD_PRICE_RANGES.get(s["name_en"])
+        proposed_max = s.get("price_max")
+        if rng and proposed_max is None:
+            proposed_max = rng[1]
+            action = "set price_max"
+        else:
+            action = "no change"
+        out.append({
+            "service": s["name_en"],
+            "old_range": ("%d-%d" % (int(rng[0]), int(rng[1]))) if rng else "—",
+            "price": s["price"],
+            "price_max": proposed_max,
+            "action": action,
         })
+    return out
 
-    return {"settings": settings, "doctors": doctors, "services": services}
 
-
-def preview_seed(prompt_bn, prompt_en, ai_model="openrouter/auto"):
-    """Return the extracted seed data as-is, for review before insertion."""
-    return extract_seed(prompt_bn, prompt_en, ai_model=ai_model)
+def _backfill_price_max():
+    """Fill ``price_max`` from the known ranges where it is still NULL."""
+    pending = [
+        (OLD_PRICE_RANGES[s["name_en"]], s)
+        for s in list_services()
+        if s["name_en"] in OLD_PRICE_RANGES and s.get("price_max") is None
+    ]
+    if not pending:
+        return
+    print("\n[db] Backfilling services.price_max from the old prompt ranges:")
+    print("    %-12s %-12s %-10s %s" % ("service", "old range", "price", "price_max"))
+    with _connect() as conn:
+        for rng, s in pending:
+            print("    %-12s %-12s %-10s %s" % (
+                s["name_en"], "%d-%d" % (int(rng[0]), int(rng[1])),
+                int(rng[0]), int(rng[1])))
+            conn.execute(
+                "UPDATE services SET price_max = ? WHERE id = ?",
+                (rng[1], s["id"]),
+            )
+    print()
 
 
 # ─── SEEDING ──────────────────────────────────────────────────────────────────
 
-def _seed_if_empty(prompt_bn, prompt_en, ai_model):
-    """Insert seed data when the settings table is empty."""
+def _seed_if_empty(ai_model=None):
+    """Insert the built-in clinic data when the settings table is empty."""
     with _connect() as conn:
         empty = conn.execute("SELECT COUNT(*) AS n FROM settings").fetchone()["n"] == 0
     if not empty:
         return
 
-    data = extract_seed(prompt_bn, prompt_en, ai_model=ai_model)
-
-    print("\n[db] Seeding initial data extracted from the system prompts:")
-    print(json.dumps(data, ensure_ascii=False, indent=2))
-
+    print("[db] Seeding initial clinic data...")
+    data = SEED_DATA
     with _connect() as conn:
         for key, value in data["settings"].items():
+            if key == "ai_model" and ai_model:
+                value = ai_model
             conn.execute(
                 "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
                 (key, value),
@@ -403,9 +352,9 @@ def _seed_if_empty(prompt_bn, prompt_en, ai_model):
         for svc in data["services"]:
             conn.execute(
                 """INSERT INTO services
-                   (name_en, name_bn, price, duration_minutes, active)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (svc["name_en"], svc["name_bn"], svc["price"],
+                   (name_en, name_bn, price, price_max, duration_minutes, active)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (svc["name_en"], svc["name_bn"], svc["price"], svc["price_max"],
                  svc["duration_minutes"], svc["active"]),
             )
     print("[db] Seed complete.\n")
@@ -482,17 +431,18 @@ def _migrate_appointments_json():
 
 # ─── INIT ─────────────────────────────────────────────────────────────────────
 
-def init_db(prompt_bn=None, prompt_en=None, ai_model="openrouter/auto",
-            admin_username=None, admin_password=None):
-    """Create tables, seed initial data, seed an admin and migrate old data.
+def init_db(ai_model="openrouter/auto", admin_username=None, admin_password=None):
+    """Create tables, migrate columns, seed data, seed admin, migrate JSON.
 
     Safe to call on every app startup: table creation uses ``IF NOT EXISTS``,
-    seeding only happens when a table is empty, and the legacy JSON migration
-    only runs while ``appointments.json`` still exists.
+    column migrations check for the column first, seeding only happens when the
+    settings table is empty, and the legacy JSON migration only runs while
+    ``appointments.json`` still exists.
     """
     _create_tables()
-    if prompt_bn and prompt_en:
-        _seed_if_empty(prompt_bn, prompt_en, ai_model)
+    _seed_if_empty(ai_model)
+    _migrate_columns()
+    _backfill_price_max()
     if admin_username and admin_password:
         ensure_admin(admin_username, admin_password)
     _migrate_appointments_json()
@@ -515,6 +465,107 @@ def set_setting(key, value):
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+
+def format_price(price, price_max=None):
+    """Format a price as ``'300-500 BDT'`` (range) or ``'300 BDT'`` (fixed)."""
+    if price is None:
+        return ""
+    def _fmt(value):
+        return str(int(value)) if float(value).is_integer() else str(value)
+    if price_max is not None and price_max != price:
+        return "%s-%s BDT" % (_fmt(price), _fmt(price_max))
+    return "%s BDT" % _fmt(price)
+
+
+# ─── AVAILABILITY ─────────────────────────────────────────────────────────────
+
+def get_available_slots(doctor_id, date):
+    """Return the free ``'HH:MM'`` slots for a doctor on a date (Asia/Dhaka).
+
+    Slots come from the doctor's weekly schedule, generated every
+    ``slot_minutes``. Slots already booked (any status except ``cancelled``)
+    are removed, and when ``date`` is today, slots already in the past are
+    removed too.
+    """
+    doctor = get_doctor(doctor_id)
+    if not doctor:
+        return []
+    try:
+        day = datetime.date.fromisoformat(date)
+    except (ValueError, TypeError):
+        return []
+
+    slot_minutes = doctor.get("slot_minutes") or 30
+    minutes = []
+    for row in doctor["schedule"]:
+        if row["weekday"] != day.weekday():
+            continue
+        start, end = _to_minutes(row["start_time"]), _to_minutes(row["end_time"])
+        t = start
+        while t < end:
+            minutes.append(t)
+            t += slot_minutes
+
+    with _connect() as conn:
+        booked = {
+            r["time"] for r in conn.execute(
+                """SELECT time FROM appointments
+                   WHERE doctor_id = ? AND date = ? AND status != 'cancelled'""",
+                (doctor_id, date),
+            )
+        }
+    minutes = [m for m in minutes if _from_minutes(m) not in booked]
+
+    now = dhaka_now()
+    if date == now.strftime("%Y-%m-%d"):
+        now_minutes = now.hour * 60 + now.minute
+        minutes = [m for m in minutes if m > now_minutes]
+
+    return [_from_minutes(m) for m in sorted(set(minutes))]
+
+
+def get_next_available_slots(doctor_id, days=7):
+    """Return availability for the next ``days`` days as a list of dicts.
+
+    Each item is ``{"date": 'YYYY-MM-DD', "weekday": 0-6, "slots": [...]}``
+    and only days with at least one free slot are included.
+    """
+    out = []
+    today = dhaka_today()
+    for offset in range(days):
+        day = today + datetime.timedelta(days=offset)
+        date = day.isoformat()
+        slots = get_available_slots(doctor_id, date)
+        if slots:
+            out.append({"date": date, "weekday": day.weekday(), "slots": slots})
+    return out
+
+
+def find_doctor_by_name(name):
+    """Return an active doctor matching an English or Bengali name, else None."""
+    name = (name or "").strip().lower()
+    if not name:
+        return None
+    for doc in list_doctors(active_only=True):
+        if (doc["name_en"] or "").lower() == name:
+            return doc
+        if (doc["name_bn"] or "").strip().lower() == name:
+            return doc
+    return None
+
+
+def find_service_by_name(name):
+    """Return an active service matching an English or Bengali name, else None."""
+    name = (name or "").strip().lower()
+    if not name:
+        return None
+    for svc in list_services(active_only=True):
+        if (svc["name_en"] or "").lower() == name:
+            return svc
+        if (svc["name_bn"] or "").strip().lower() == name:
+            return svc
+    return None
 
 
 # ─── DOCTORS ──────────────────────────────────────────────────────────────────
@@ -622,21 +673,22 @@ def get_service(service_id):
     return dict(row) if row else None
 
 
-def create_service(name_en=None, name_bn=None, price=None, duration_minutes=30, active=1):
+def create_service(name_en=None, name_bn=None, price=None, price_max=None,
+                   duration_minutes=30, active=1):
     """Create a service. Returns the new id."""
     with _connect() as conn:
         cur = conn.execute(
             """INSERT INTO services
-               (name_en, name_bn, price, duration_minutes, active)
-               VALUES (?, ?, ?, ?, ?)""",
-            (name_en, name_bn, price, duration_minutes, active),
+               (name_en, name_bn, price, price_max, duration_minutes, active)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (name_en, name_bn, price, price_max, duration_minutes, active),
         )
     return cur.lastrowid
 
 
 def update_service(service_id, **fields):
     """Update allowed service fields. Returns the updated dict or None."""
-    allowed = {"name_en", "name_bn", "price", "duration_minutes", "active"}
+    allowed = {"name_en", "name_bn", "price", "price_max", "duration_minutes", "active"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if updates:
         assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -686,19 +738,47 @@ def get_appointment(appointment_id):
 
 def create_appointment(patient_name=None, phone=None, doctor_id=None, service_id=None,
                        date=None, time=None, status="pending", notes=None,
-                       language=None):
+                       language=None, session_id=None):
     """Create an appointment. Returns the new id."""
     now = _now()
     with _connect() as conn:
         cur = conn.execute(
             """INSERT INTO appointments
                (patient_name, phone, doctor_id, service_id, date, time,
-                status, notes, language, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, notes, language, session_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (patient_name, phone, doctor_id, service_id, date, time,
-             status, notes, language, now, now),
+             status, notes, language, session_id, now, now),
         )
     return cur.lastrowid
+
+
+def book_appointment(patient_name, phone, doctor_id, service_id, date, time,
+                     notes=None, language=None, session_id=None):
+    """Atomically book a slot, returning the new id or ``None`` if taken.
+
+    Runs inside a ``BEGIN IMMEDIATE`` transaction and re-checks for an
+    existing booking for the same doctor/date/time, so two simultaneous
+    requests cannot double-book the same slot.
+    """
+    now = _now()
+    with _connect_tx() as conn:
+        clash = conn.execute(
+            """SELECT 1 FROM appointments
+               WHERE doctor_id = ? AND date = ? AND time = ? AND status != 'cancelled'""",
+            (doctor_id, date, time),
+        ).fetchone()
+        if clash:
+            return None
+        cur = conn.execute(
+            """INSERT INTO appointments
+               (patient_name, phone, doctor_id, service_id, date, time,
+                status, notes, language, session_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (patient_name, phone, doctor_id, service_id, date, time,
+             "pending", notes, language, session_id, now, now),
+        )
+        return cur.lastrowid
 
 
 def update_appointment(appointment_id, **fields):
@@ -707,7 +787,7 @@ def update_appointment(appointment_id, **fields):
     Returns the updated dict or ``None``.
     """
     allowed = {"patient_name", "phone", "doctor_id", "service_id", "date",
-               "time", "status", "notes", "language"}
+               "time", "status", "notes", "language", "session_id"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     updates["updated_at"] = _now()
     assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -728,6 +808,9 @@ def delete_appointment(appointment_id):
 
 # ─── CHAT MESSAGES ────────────────────────────────────────────────────────────
 
+RESET_MARKER = "__RESET__"
+
+
 def add_chat_message(session_id, role, content):
     """Append a chat message to the log. Returns the new id."""
     with _connect() as conn:
@@ -739,17 +822,36 @@ def add_chat_message(session_id, role, content):
     return cur.lastrowid
 
 
-def get_recent_messages(session_id, limit=20):
-    """Return the most recent messages for a session, oldest first."""
+def reset_conversation(session_id):
+    """Start a fresh conversation without deleting the message log.
+
+    Inserts a reset marker; ``get_recent_messages`` ignores everything before
+    the most recent marker.
+    """
+    return add_chat_message(session_id, "system", RESET_MARKER)
+
+
+def get_recent_messages(session_id, limit=12):
+    """Return the last ``limit`` user/assistant messages, oldest first.
+
+    Messages before the most recent reset marker are ignored, so a reset
+    starts a fresh conversation without destroying history.
+    """
     with _connect() as conn:
+        marker = conn.execute(
+            """SELECT MAX(id) AS m FROM chat_messages
+               WHERE session_id = ? AND role = 'system' AND content = ?""",
+            (session_id, RESET_MARKER),
+        ).fetchone()["m"] or 0
         rows = conn.execute(
             """SELECT * FROM (
                    SELECT * FROM chat_messages
-                   WHERE session_id = ?
+                   WHERE session_id = ? AND id > ?
+                     AND role IN ('user', 'assistant')
                    ORDER BY id DESC
                    LIMIT ?
                ) ORDER BY id ASC""",
-            (session_id, limit),
+            (session_id, marker, limit),
         ).fetchall()
     return _rows_to_dicts(rows)
 

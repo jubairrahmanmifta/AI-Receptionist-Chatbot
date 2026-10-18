@@ -52,18 +52,29 @@ python app.py
 On first run the app creates `clinic.db`, seeds the clinic settings, doctors,
 schedules and services, seeds one admin account from your env/config, and
 migrates any legacy `appointments.json` (renaming it to
-`appointments.json.migrated`).
+`appointments.json.migrated`). The system prompt is assembled from the database
+at request time by `prompt_builder.py` — nothing about the clinic is hardcoded.
 
 ## URLs
 - Website  : http://localhost:5000
 - Admin    : http://localhost:5000/admin  (username/password from your config or env)
 - Settings : http://localhost:5000/admin/config
 
+## Tests
+```bash
+python test_booking.py
+```
+Runs the booking pipeline against a throwaway database with a mocked AI
+(normal booking, taken slot, invalid phone, non-working day, past date,
+malformed marker, atomic double-booking, reset, rate limit).
+
 ## File structure
 ```
 dental_v4/
-├── app.py              ← Flask routes / main server
-├── db.py               ← All SQLite access + schema/seed/migration
+├── app.py              ← Flask routes / booking pipeline
+├── db.py               ← All SQLite access + schema/seed/migration/availability
+├── prompt_builder.py   ← Builds the system prompt from the database
+├── test_booking.py     ← Booking pipeline tests (mocked AI, temp DB)
 ├── clinic.db           ← SQLite database (gitignored, auto-created)
 ├── config.example.json ← Template for config.json (safe to commit)
 ├── config.json         ← Your real secrets (gitignored)

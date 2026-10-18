@@ -1,8 +1,11 @@
 import os
+import re
 import json
+import time
 import datetime
 import functools
 import secrets
+import threading
 from flask import (
     Flask, render_template, request,
     jsonify, session, redirect, url_for
@@ -10,6 +13,7 @@ from flask import (
 import requests
 
 import db
+import prompt_builder
 
 # Load variables from a local .env file if python-dotenv is available.
 # This is optional — you can also just export the variables in your shell.
@@ -60,117 +64,82 @@ def save_config(cfg):
 def get_cfg(key):
     return load_config().get(key, "")
 
-# ─── CLINIC SYSTEM PROMPTS ─────────────────────────────────────────────────────
-SYSTEM_PROMPT_BN = """
-তুমি মিতা — স্মাইল ডেন্টাল কেয়ারের রিসেপশনিস্ট। তুমি একজন উষ্ণ, যত্নশীল মানুষের মতো কথা বলো — রোবটের মতো না।
-
-তোমার ব্যক্তিত্ব:
-- সহজ, প্রাকৃতিক বাংলায় কথা বলো যেভাবে বাস্তবে মানুষ বলে
-- মাঝে মাঝে "আচ্ছা", "হ্যাঁ অবশ্যই", "বুঝতে পেরেছি", "ঠিক আছে" এই ধরনের স্বাভাবিক expression ব্যবহার করো
-- রোগী কষ্টে থাকলে সহানুভূতি দেখাও — যেমন "আহ, দাঁতের ব্যথা সত্যিই খুব কষ্টের!"
-- কখনো bullet point বা numbered list ব্যবহার করবে না
-- এক সাথে অনেক প্রশ্ন করবে না — একটা করে জিজ্ঞেস করো
-- উত্তর ছোট রাখো, স্বাভাবিক কথোপকথনের মতো
-
-ক্লিনিকের তথ্য:
-- নাম: স্মাইল ডেন্টাল কেয়ার | ঠিকানা: ধানমন্ডি ২৭, ঢাকা
-- সময়: সকাল ৯টা — রাত ৮টা (রবিবার বন্ধ)
-
-ডাক্তার:
-- ডা. রাহেলা খানম (দাঁতের বিশেষজ্ঞ): সোম, বুধ, শুক্র — সকাল ১০টা–দুপুর ২টা
-- ডা. করিম সাহেব (শিশু দন্ত বিশেষজ্ঞ): মঙ্গল, বৃহস্পতি — বিকাল ৪টা–রাত ৮টা
-
-সেবা ও খরচ:
-চেকআপ ৩০০–৫০০৳ | স্কেলিং ৮০০–১২০০৳ | ফিলিং ৫০০–১৫০০৳
-রুট ক্যানেল ৩০০০–৬০০০৳ | দাঁত তোলা ৫০০–১০০০৳ | ডেনচার ৫০০০–১৫০০০৳
-
-অ্যাপয়েন্টমেন্ট নেওয়ার ধাপ:
-আগে রোগীর সমস্যাটা মন দিয়ে শোনো। তারপর স্বাভাবিকভাবে জিজ্ঞেস করো — নাম, তারপর ফোন নম্বর, তারপর কবে আসতে চায়। তারিখ না বললে নিজে suggest করো।
-
-সব তথ্য পেলে এভাবে confirm করো:
-"তাহলে আমি আপনার অ্যাপয়েন্টমেন্টটা নিশ্চিত করে দিচ্ছি!"
-তারপর উত্তরের একদম শেষে এই JSON রাখো — এটা রোগী দেখতে পাবে না:
-SAVE_APPOINTMENT:{"name":"নাম","phone":"ফোন","problem":"সমস্যা","date":"YYYY-MM-DD","time":"HH:MM"}
-"""
-
-SYSTEM_PROMPT_EN = """
-You are Mita — a receptionist at Smile Dental Care. Talk like a warm, caring human being — not a robot or a formal assistant.
-
-Your personality:
-- Speak naturally and conversationally, like a real person would
-- Use natural expressions like "Of course!", "Got it!", "Sure thing!", "Oh no, that sounds painful!"
-- Show empathy when patients are in pain — e.g. "Oh that must be really uncomfortable, let's get you sorted!"
-- Never use bullet points, numbered lists, or formal structured responses
-- Ask one question at a time — don't bombard them
-- Keep replies short and natural
-
-Clinic Info:
-- Name: Smile Dental Care | Address: Dhanmondi 27, Dhaka
-- Hours: 9 AM — 8 PM (Closed Sundays)
-
-Doctors:
-- Dr. Rahela Khanam (Dental Specialist): Mon, Wed, Fri — 10 AM to 2 PM
-- Dr. Karim (Pediatric Dentist): Tue, Thu — 4 PM to 8 PM
-
-Services:
-Checkup 300–500 BDT | Scaling 800–1200 BDT | Filling 500–1500 BDT
-Root Canal 3000–6000 BDT | Extraction 500–1000 BDT | Denture 5000–15000 BDT
-
-How to take appointments:
-First listen carefully to what's bothering them. Then naturally ask for their name, then phone number, then preferred date. If they don't mention a date, suggest one yourself based on the doctor schedule.
-
-Once you have everything, say something like:
-"Perfect, let me get that booked for you right away!"
-Then at the very end of your message include this JSON — the patient won't see it:
-SAVE_APPOINTMENT:{"name":"name","phone":"phone","problem":"problem","date":"YYYY-MM-DD","time":"HH:MM"}
-"""
-
-# ─── CONVERSATION STORE ────────────────────────────────────────────────────────
-conversations = {}  # session_id -> list of messages
-
 # ─── DATABASE INIT ─────────────────────────────────────────────────────────────
-# Creates clinic.db (if needed), seeds clinic data from the prompts above,
+# Creates clinic.db (if needed), migrates columns, seeds clinic data from db.py,
 # seeds an admin account, and migrates any legacy appointments.json.
-# Set SKIP_DB_INIT=1 to skip this (used for tooling/preview).
+# Set SKIP_DB_INIT=1 to skip this (used for tooling/testing).
 if os.environ.get("SKIP_DB_INIT") != "1":
     _cfg = load_config()
     db.init_db(
-        SYSTEM_PROMPT_BN,
-        SYSTEM_PROMPT_EN,
         ai_model=_cfg.get("openrouter_model") or "openrouter/auto",
         admin_username=_cfg.get("admin_username"),
         admin_password=_cfg.get("admin_password"),
     )
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
+BOOKING_MARKER  = "SAVE_APPOINTMENT:"
+PHONE_RE        = re.compile(r"^(?:\+?880|0)1[3-9]\d{8}$")
+MAX_NAME_LEN    = 100
+MAX_DAYS_AHEAD  = 60
+HISTORY_LIMIT   = 12
+MAX_MESSAGE_LEN = 1000
+
+# Simple in-memory per-IP rate limit for /chat.
+RATE_LIMIT    = 20     # requests ...
+RATE_WINDOW   = 60     # ... per this many seconds
+_rate_buckets = {}
+_rate_lock    = threading.Lock()
+
+
+def _rate_limited(ip):
+    """Return True when ``ip`` has exceeded the per-minute request limit."""
+    now = time.time()
+    with _rate_lock:
+        stamps = [t for t in _rate_buckets.get(ip, []) if now - t < RATE_WINDOW]
+        if len(stamps) >= RATE_LIMIT:
+            _rate_buckets[ip] = stamps
+            return True
+        stamps.append(now)
+        _rate_buckets[ip] = stamps
+    return False
+
+
 def _public_appt(appt):
-    """Shape an appointment dict like the old JSON records (for /chat output)."""
+    """Shape an appointment dict for the /chat response."""
+    if not appt:
+        return None
     return {
-        "name":    appt.get("patient_name"),
-        "phone":   appt.get("phone"),
-        "problem": appt.get("notes"),
-        "date":    appt.get("date"),
-        "time":    appt.get("time"),
+        "id":       appt.get("id"),
+        "name":     appt.get("patient_name"),
+        "phone":    appt.get("phone"),
+        "problem":  appt.get("notes"),
+        "doctor_id": appt.get("doctor_id"),
+        "service_id": appt.get("service_id"),
+        "date":     appt.get("date"),
+        "time":     appt.get("time"),
+        "status":   appt.get("status"),
         "saved_at": appt.get("created_at"),
     }
 
-# ─── AI CHAT ──────────────────────────────────────────────────────────────────
-def chat_with_ai(session_id, user_message, lang="bn"):
-    cfg   = load_config()
-    api_key = cfg.get("openrouter_api_key", "")
-    model   = cfg.get("openrouter_model", "google/gemma-4-31b-it:free")
 
-    if not api_key or "বসান" in api_key or api_key.startswith("YOUR_"):
+# ─── AI CHAT ──────────────────────────────────────────────────────────────────
+def _openrouter_chat(messages, lang="bn"):
+    """Send ``messages`` to OpenRouter and return the reply text.
+
+    The model comes from the ``ai_model`` setting (fallback ``openrouter/auto``)
+    and the API key from ``OPENROUTER_API_KEY`` first, then ``config.json``.
+    Errors are returned as friendly bilingual strings.
+    """
+    cfg     = load_config()
+    api_key = os.environ.get("OPENROUTER_API_KEY") or cfg.get("openrouter_api_key", "")
+    settings = db.get_settings()
+    model   = (settings.get("ai_model") or "").strip() or "openrouter/auto"
+    title   = (settings.get("clinic_name") or settings.get("clinic_name_bn")
+               or "AI Receptionist")
+
+    if not api_key or api_key.startswith("YOUR_") or "বসান" in api_key:
         return ("OPENROUTER_API_KEY env var অথবা config.json ফাইলে API key বসান।" if lang == "bn"
                 else "Please set OPENROUTER_API_KEY or your API key in config.json.")
-
-    if session_id not in conversations:
-        conversations[session_id] = []
-    conversations[session_id].append({"role": "user", "content": user_message})
-
-    system = SYSTEM_PROMPT_BN if lang == "bn" else SYSTEM_PROMPT_EN
-    today  = datetime.datetime.now().strftime("%Y-%m-%d (%A)")
-    system += f"\n\nআজকের তারিখ / Today: {today}"
 
     try:
         resp = requests.post(
@@ -179,14 +148,11 @@ def chat_with_ai(session_id, user_message, lang="bn"):
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": "http://localhost:5000",
-                "X-Title": "Smile Dental Care",
+                "X-Title": title,
             },
             json={
                 "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    *conversations[session_id],
-                ],
+                "messages": messages,
                 "max_tokens": 400,
                 "temperature": 0.7,
             },
@@ -195,9 +161,7 @@ def chat_with_ai(session_id, user_message, lang="bn"):
         print(f"[OpenRouter] status={resp.status_code}")
         print(f"[OpenRouter] response={resp.text[:500]}")
         resp.raise_for_status()
-        reply = resp.json()["choices"][0]["message"]["content"]
-        conversations[session_id].append({"role": "assistant", "content": reply})
-        return reply
+        return resp.json()["choices"][0]["message"]["content"]
 
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code if e.response else "?"
@@ -205,8 +169,8 @@ def chat_with_ai(session_id, user_message, lang="bn"):
             return ("API key ভুল। config.json চেক করুন।" if lang == "bn"
                     else "Invalid API key. Please check config.json.")
         if code == 404:
-            return ("Model পাওয়া যাচ্ছে না। config.json এ model name চেক করুন।" if lang == "bn"
-                    else f"Model not found ({model}). Check model name in config.json.")
+            return (f"Model পাওয়া যাচ্ছে না ({model})।" if lang == "bn"
+                    else f"Model not found ({model}).")
         if code == 429:
             return ("অনেক বেশি request হয়েছে। একটু পরে আবার চেষ্টা করুন।" if lang == "bn"
                     else "Too many requests. Please wait a moment and try again.")
@@ -214,8 +178,7 @@ def chat_with_ai(session_id, user_message, lang="bn"):
                 else f"Server error ({code}). Please try again.")
 
     except requests.exceptions.ConnectionError:
-        return ("ইন্টারনেট সংযোগ নেই।" if lang == "bn"
-                else "No internet connection.")
+        return ("ইন্টারনেট সংযোগ নেই।" if lang == "bn" else "No internet connection.")
 
     except requests.exceptions.Timeout:
         return ("সময় শেষ হয়ে গেছে। আবার চেষ্টা করুন।" if lang == "bn"
@@ -225,6 +188,157 @@ def chat_with_ai(session_id, user_message, lang="bn"):
         return (f"সমস্যা হয়েছে: {str(e)}" if lang == "bn"
                 else f"Something went wrong: {str(e)}")
 
+
+def _history_messages(session_id):
+    """Return the last HISTORY_LIMIT messages formatted for the API."""
+    return [
+        {"role": m["role"], "content": m["content"]}
+        for m in db.get_recent_messages(session_id, limit=HISTORY_LIMIT)
+    ]
+
+
+def generate_reply(session_id, user_message, lang="bn"):
+    """Store the user message and return the model's reply using DB history."""
+    db.add_chat_message(session_id, "user", user_message)
+    system = prompt_builder.build_system_prompt(lang)
+    messages = [{"role": "system", "content": system}] + _history_messages(session_id)
+    return _openrouter_chat(messages, lang)
+
+
+def corrective_reply(session_id, lang, instruction):
+    """Second, hidden call telling the model what was wrong with a booking."""
+    system = prompt_builder.build_system_prompt(lang) + "\n\n" + instruction
+    messages = [{"role": "system", "content": system}] + _history_messages(session_id)
+    return _openrouter_chat(messages, lang)
+
+
+def _extract_booking(reply):
+    """Split the visible reply from the booking marker.
+
+    Returns ``(visible_reply, payload_or_None, marker_present)``. The marker is
+    always stripped from the visible reply, even when the JSON is malformed.
+    """
+    if BOOKING_MARKER not in reply:
+        return reply.strip(), None, False
+
+    before, after = reply.split(BOOKING_MARKER, 1)
+    visible = before.strip()
+    raw = after.strip().splitlines()[0].strip() if after.strip() else ""
+    payload = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except (ValueError, TypeError):
+            payload = None
+    return visible, payload, True
+
+
+def _validate_booking(payload, lang):
+    """Validate a parsed booking payload.
+
+    Returns ``(booking_dict_or_None, error_message_or_None)``.
+    """
+    def err(en, bn):
+        return bn if lang == "bn" else en
+
+    name = str(payload.get("patient_name") or "").strip()
+    if not name:
+        return None, err("I still need the patient's name to book.",
+                         "বুকিং করার জন্য রোগীর নামটা দরকার।")
+    if len(name) > MAX_NAME_LEN:
+        return None, err("That name is too long.",
+                         "নামটা একটু ছোট করে বলুন।")
+
+    phone = re.sub(r"[\s\-()]", "", str(payload.get("phone") or ""))
+    if not PHONE_RE.match(phone):
+        return None, err("That phone number doesn't look like a valid Bangladeshi number.",
+                         "ফোন নম্বরটা সঠিক বাংলাদেশি নম্বর মনে হচ্ছে না।")
+
+    doctor = None
+    raw_id = payload.get("doctor_id")
+    if raw_id not in (None, "", 0):
+        try:
+            doctor = db.get_doctor(int(raw_id))
+        except (ValueError, TypeError):
+            doctor = None
+    if doctor is None:
+        doctor = db.find_doctor_by_name(payload.get("doctor_name") or payload.get("doctor"))
+    if doctor is None or not doctor.get("active"):
+        return None, err("We couldn't match that doctor. Please pick one of our doctors.",
+                         "ডাক্তারটা মেলাতে পারলাম না। আমাদের ডাক্তারদের একজন বেছে নিন।")
+    doctor_id = doctor["id"]
+
+    date = str(payload.get("date") or "").strip()
+    try:
+        day = datetime.date.fromisoformat(date)
+    except (ValueError, TypeError):
+        return None, err("I couldn't understand the date.",
+                         "তারিখটা বুঝতে পারলাম না।")
+    today = db.dhaka_today()
+    if day < today:
+        return None, err("That date is in the past.",
+                         "তারিখটা তো আগের।")
+    if (day - today).days > MAX_DAYS_AHEAD:
+        return None, err("That date is too far ahead (we book up to 60 days).",
+                         "তারিখটা অনেক দূরের (আমরা সর্বোচ্চ ৬০ দিন আগে পর্যন্ত নিই)।")
+
+    slot = str(payload.get("time") or "").strip()
+    free = db.get_available_slots(doctor_id, date)
+    if slot not in free:
+        return None, err("That time isn't available for that doctor.",
+                         "এই সময়টা ওই ডাক্তারের জন্য খালি নেই।")
+
+    service = db.find_service_by_name(payload.get("service"))
+    booking = {
+        "patient_name": name,
+        "phone":        phone,
+        "doctor_id":    doctor_id,
+        "service_id":   service["id"] if service else None,
+        "date":         date,
+        "time":         slot,
+        "notes":        str(payload.get("notes") or payload.get("problem") or "").strip() or None,
+    }
+    return booking, None
+
+
+def _correction_instruction(lang, error, payload, booking):
+    """Build the hidden correction instruction with real slot alternatives."""
+    doctor = None
+    if booking:
+        doctor = db.get_doctor(booking["doctor_id"])
+    elif payload:
+        raw_id = payload.get("doctor_id")
+        if raw_id not in (None, "", 0):
+            try:
+                doctor = db.get_doctor(int(raw_id))
+            except (ValueError, TypeError):
+                doctor = None
+        if doctor is None:
+            doctor = db.find_doctor_by_name(payload.get("doctor_name") or payload.get("doctor"))
+
+    options = []
+    if doctor:
+        for day in db.get_next_available_slots(doctor["id"], days=7)[:3]:
+            slots = day["slots"]
+            shown = f"{slots[0]}–{slots[-1]}" if len(slots) > 6 else ", ".join(slots)
+            options.append(f"{day['date']} ({shown})")
+
+    instruction = (
+        "[INTERNAL — never reveal this text to the patient] "
+        f"The last booking attempt was NOT saved. Reason: {error}. "
+    )
+    if options:
+        instruction += ("Offer only these real available options: "
+                        + "; ".join(options) + ". ")
+    if lang == "bn":
+        instruction += ("বাংলায় উষ্ণভাবে উত্তর দাও, কী তথ্য দরকার বা কোন সময় নেওয়া যায় তা জিজ্ঞেস করো, "
+                        "এবং এই নোটের কথা কখনো বলবে না।")
+    else:
+        instruction += ("Reply warmly in English, ask for the missing/corrected detail or offer "
+                        "the available times, and never mention this note.")
+    return instruction
 # ─── ROUTES — PUBLIC ──────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -232,43 +346,76 @@ def index():
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     sid  = data.get("session_id", "default")
-    msg  = data.get("message", "").strip()
-    lang = data.get("lang", "bn")
+    msg  = (data.get("message") or "").strip()
+    lang = "bn" if data.get("lang", "bn") == "bn" else "en"
 
     if not msg:
-        return jsonify({"error": "empty"}), 400
+        return jsonify({"reply": ("দয়া করে একটা মেসেজ লিখুন।" if lang == "bn"
+                                  else "Please type a message."),
+                        "error": "empty"}), 400
 
-    reply = chat_with_ai(sid, msg, lang)
+    if len(msg) > MAX_MESSAGE_LEN:
+        return jsonify({"reply": ("মেসেজটা অনেক বড় — সর্বোচ্চ ১০০০ অক্ষর।" if lang == "bn"
+                                  else "Message is too long — 1000 characters max."),
+                        "error": "too_long"}), 400
 
-    # Parse and save appointment if present
+    ip = (request.headers.get("X-Forwarded-For", "")
+          or request.remote_addr or "unknown").split(",")[0].strip()
+    if _rate_limited(ip):
+        return jsonify({"reply": ("একটু ধীরে! এক মিনিটে অনেক বার লিখেছেন — একটু পরে আবার চেষ্টা করুন।"
+                                  if lang == "bn"
+                                  else "Slow down! Too many messages in a minute — please try again shortly."),
+                        "error": "rate_limited"}), 429
+
+    raw = generate_reply(sid, msg, lang)
+    visible, payload, marker_present = _extract_booking(raw)
+
     saved = False
     appt  = None
-    if "SAVE_APPOINTMENT:" in reply:
-        try:
-            raw  = reply.split("SAVE_APPOINTMENT:")[1].strip().splitlines()[0]
-            data = json.loads(raw)
-            appt_id = db.create_appointment(
-                patient_name=data.get("name"),
-                phone=data.get("phone"),
-                date=data.get("date"),
-                time=data.get("time"),
-                notes=data.get("problem"),
-                language=lang,
-            )
-            appt  = _public_appt(db.get_appointment(appt_id))
-            saved = True
-        except Exception as e:
-            print(f"[Appointment save error] {e}")
+    if marker_present:
+        if payload is None:
+            booking, error = None, ("বুকিং তথ্যটা ঠিকভাবে পড়া গেল না।" if lang == "bn"
+                                    else "I couldn't read the booking details.")
+        else:
+            booking, error = _validate_booking(payload, lang)
 
-    clean = reply.split("SAVE_APPOINTMENT:")[0].strip()
-    return jsonify({"reply": clean, "appointment_saved": saved, "appointment_data": appt})
+        if booking:
+            appt_id = db.book_appointment(
+                patient_name=booking["patient_name"],
+                phone=booking["phone"],
+                doctor_id=booking["doctor_id"],
+                service_id=booking["service_id"],
+                date=booking["date"],
+                time=booking["time"],
+                notes=booking["notes"],
+                language=lang,
+                session_id=sid,
+            )
+            if appt_id:
+                appt  = db.get_appointment(appt_id)
+                saved = True
+            else:
+                error = ("দুঃখিত, এই সময়টা এইমাত্র বুক হয়ে গেছে।" if lang == "bn"
+                         else "Sorry, that slot was just taken.")
+
+        if not saved:
+            instruction = _correction_instruction(lang, error, payload, booking)
+            visible = corrective_reply(sid, lang, instruction)
+
+    db.add_chat_message(sid, "assistant", visible)
+    return jsonify({
+        "reply": visible,
+        "appointment_saved": saved,
+        "appointment_id": appt["id"] if appt else None,
+        "appointment_data": _public_appt(appt),
+    })
 
 @app.route("/reset", methods=["POST"])
 def reset():
-    sid = request.get_json().get("session_id", "default")
-    conversations.pop(sid, None)
+    sid = (request.get_json(silent=True) or {}).get("session_id", "default")
+    db.reset_conversation(sid)
     return jsonify({"ok": True})
 
 # ─── ROUTES — ADMIN ───────────────────────────────────────────────────────────
@@ -338,7 +485,9 @@ def admin_config():
 
 if __name__ == "__main__":
     debug = os.environ.get("FLASK_DEBUG", "").lower() in ("1", "true", "yes", "on")
-    print("\n🦷 Smile Dental Care — starting...")
+    clinic_name = (db.get_settings().get("clinic_name")
+                   or db.get_settings().get("clinic_name_bn") or "AI Receptionist")
+    print(f"\n🦷 {clinic_name} — starting...")
     print("🌐 Website : http://localhost:5000")
     print("🔐 Admin   : http://localhost:5000/admin\n")
     app.run(debug=debug, port=5000)
