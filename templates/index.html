@@ -215,6 +215,33 @@
     }
     .close-btn:hover { background: #dc2626; color: #fff; }
 
+    /* HEADER ACTIONS */
+    .handoff-btn {
+      margin-left: auto; display: flex; align-items: center; gap: 5px;
+      background: #2e3a5c; color: #d1d5db; border: none; border-radius: 8px;
+      padding: 7px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+      font-family: inherit; white-space: nowrap; transition: background .2s;
+    }
+    .handoff-btn:hover  { background: #374151; color: #fff; }
+    .handoff-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .chat-header .close-btn { margin-left: 8px; }
+
+    /* STATUS BANNER */
+    .status-banner {
+      flex-shrink: 0; padding: 9px 16px; font-size: 12.5px; line-height: 1.45;
+      border-bottom: 1px solid #2e3a5c;
+      font-family: 'Hind Siliguri','Inter',sans-serif;
+    }
+    .status-banner[hidden] { display: none; }
+    .status-banner.waiting    { background: #3b2f0b; color: #fcd34d; }
+    .status-banner.with_agent { background: #06302b; color: #5eead4; font-weight: 600; }
+    .status-banner.closed     { background: #3a1d1d; color: #fca5a5; }
+    .banner-action {
+      margin-left: 8px; background: #fca5a5; color: #3a1d1d; border: none;
+      border-radius: 7px; padding: 4px 10px; font-size: 12px; font-weight: 700;
+      cursor: pointer; font-family: inherit;
+    }
+
     /* MESSAGES */
     #messages {
       flex: 1; overflow-y: auto;
@@ -225,23 +252,31 @@
     #messages::-webkit-scrollbar-thumb { background: #2e3a5c; border-radius: 3px; }
 
     .msg { display: flex; gap: 8px; max-width: 88%; }
-    .msg.agent { align-self: flex-start; }
-    .msg.user  { align-self: flex-end; flex-direction: row-reverse; }
+    .msg.bot      { align-self: flex-start; }
+    .msg.agent    { align-self: flex-start; }
+    .msg.customer { align-self: flex-end; flex-direction: row-reverse; }
+    .msg.system   { align-self: center; max-width: 94%; }
     .msg-av    { width: 28px; height: 28px; flex-shrink: 0; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; }
-    .msg.agent .msg-av { background: linear-gradient(135deg,#1240a8,var(--blue)); }
-    .msg.user  .msg-av { background: #374151; }
+    .msg.bot      .msg-av { background: linear-gradient(135deg,#1240a8,var(--blue)); }
+    .msg.agent    .msg-av { background: linear-gradient(135deg,#0f766e,#0ea5a0); }
+    .msg.customer .msg-av { background: #374151; }
+
+    .msg-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+    .msg.customer .msg-body { align-items: flex-end; }
+    .msg-name { font-size: 11px; color: #9ca3af; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+    .human-badge { background: #0ea5a0; color: #04302c; font-size: 10px; font-weight: 800; padding: 1px 6px; border-radius: 8px; letter-spacing: .3px; }
+
     .bubble {
       padding: 10px 14px; border-radius: 14px;
       font-size: 14px; line-height: 1.6;
       font-family: 'Hind Siliguri','Inter',sans-serif;
+      overflow-wrap: anywhere;
     }
-    .msg.agent .bubble { background: #242b45; color: #e5e7eb; border-top-left-radius: 4px; }
-    .msg.user  .bubble { background: var(--blue); color: #fff; border-top-right-radius: 4px; }
+    .msg.bot      .bubble { background: #242b45; color: #e5e7eb; border-top-left-radius: 4px; }
+    .msg.customer .bubble { background: var(--blue); color: #fff; border-top-right-radius: 4px; }
+    .msg.agent    .bubble { background: #08303a; color: #d1fae5; border: 1px solid #0ea5a0; border-top-left-radius: 4px; }
+    .msg.system   .bubble { background: transparent; color: #8b93a7; font-size: 12px; text-align: center; padding: 4px 10px; }
 
-    .typing-bubble {
-      align-self: flex-start; display: flex; gap: 8px;
-      align-items: center;
-    }
     .dots { display: flex; gap: 4px; padding: 10px 14px; background: #242b45; border-radius: 14px; border-top-left-radius: 4px; }
     .dots span { width: 6px; height: 6px; background: #6b7280; border-radius: 50%; animation: blink 1.2s infinite; }
     .dots span:nth-child(2) { animation-delay: .2s; }
@@ -249,12 +284,41 @@
     @keyframes blink { 0%,80%,100%{opacity:.2} 40%{opacity:1} }
 
     .saved-msg {
-      align-self: center;
+      align-self: center; text-align: center;
       background: #052e16; border: 1px solid #16a34a;
       border-radius: 10px; padding: 9px 16px;
       font-size: 13px; color: #4ade80;
       font-family: 'Hind Siliguri','Inter',sans-serif;
     }
+
+    .reconnect-note {
+      flex-shrink: 0; text-align: center; font-size: 11.5px;
+      color: #fbbf24; padding: 4px;
+      font-family: 'Hind Siliguri','Inter',sans-serif;
+    }
+    .reconnect-note[hidden] { display: none; }
+
+    /* CALLBACK FORM */
+    .callback-form {
+      flex-shrink: 0; border-top: 1px solid #2e3a5c; padding: 12px 14px;
+      background: #1f2540; display: flex; flex-direction: column; gap: 8px;
+    }
+    .callback-form[hidden] { display: none; }
+    .callback-form .cb-title { font-size: 13px; color: #e5e7eb; font-weight: 600; font-family: 'Hind Siliguri','Inter',sans-serif; }
+    .callback-form input, .callback-form textarea {
+      background: #242b45; border: 1px solid #2e3a5c; border-radius: 9px;
+      padding: 9px 12px; color: #e5e7eb; font-family: 'Hind Siliguri','Inter',sans-serif;
+      font-size: 13.5px; outline: none; width: 100%; resize: none;
+    }
+    .callback-form input:focus, .callback-form textarea:focus { border-color: var(--blue); }
+    .callback-form .cb-error { color: #fca5a5; font-size: 12px; }
+    .callback-form .cb-error[hidden] { display: none; }
+    .cb-actions { display: flex; gap: 8px; }
+    .cb-actions button { flex: 1; padding: 9px; border: none; border-radius: 9px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit; }
+    #cb-submit { background: var(--blue); color: #fff; }
+    #cb-submit:hover { background: var(--blue-dk); }
+    #cb-submit:disabled { background: #2e3a5c; cursor: not-allowed; }
+    #cb-cancel { background: transparent; border: 1px solid #2e3a5c; color: #9ca3af; }
 
     /* INPUT */
     .chat-input {
@@ -282,6 +346,26 @@
 
     #step-chat { display: none; flex-direction: column; flex: 1; overflow: hidden; }
 
+    /* FLOATING LAUNCHER */
+    .launcher {
+      position: fixed; right: 22px; bottom: 22px; z-index: 998;
+      width: 60px; height: 60px; border-radius: 50%;
+      background: var(--blue); color: #fff; border: none; cursor: pointer;
+      font-size: 26px; box-shadow: 0 8px 28px rgba(26,86,219,.45);
+      display: flex; align-items: center; justify-content: center;
+      transition: transform .2s, background .2s;
+    }
+    .launcher:hover { transform: scale(1.06); background: var(--blue-dk); }
+    .launcher.has-unread { animation: lpulse 1.6s infinite; }
+    @keyframes lpulse { 0%,100%{box-shadow:0 8px 28px rgba(26,86,219,.45)} 50%{box-shadow:0 0 0 12px rgba(26,86,219,0)} }
+    .unread-badge {
+      position: absolute; top: -3px; right: -3px; min-width: 22px; height: 22px;
+      background: #dc2626; color: #fff; border-radius: 11px; font-size: 12px;
+      font-weight: 700; display: flex; align-items: center; justify-content: center;
+      padding: 0 5px; border: 2px solid #fff;
+    }
+    .unread-badge[hidden] { display: none; }
+
     @media(max-width:900px) {
       nav { padding: 0 20px; }
       .nav-links { display: none; }
@@ -293,6 +377,11 @@
       footer { padding: 24px; flex-direction: column; gap: 6px; text-align: center; }
       #overlay { padding: 0; align-items: flex-end; justify-content: center; }
       .chat-box { width: 100%; border-bottom-left-radius: 0; border-bottom-right-radius: 0; height: 70vh; }
+    }
+    @media(max-width:560px) {
+      #overlay { align-items: stretch; }
+      .chat-box { width: 100%; height: 100vh; height: 100dvh; border-radius: 0; }
+      .launcher { right: 16px; bottom: 16px; }
     }
   </style>
 </head>
@@ -388,9 +477,15 @@
   <div>© 2026 All rights reserved</div>
 </footer>
 
+<!-- FLOATING LAUNCHER -->
+<button id="launcher" class="launcher" onclick="openChat()" aria-label="Open chat">
+  💬
+  <span id="unread-badge" class="unread-badge" hidden>0</span>
+</button>
+
 <!-- CHAT POPUP -->
 <div id="overlay">
-  <div class="chat-box">
+  <div class="chat-box" role="dialog" aria-modal="false" aria-label="Chat with Smile Dental Care">
 
     <!-- Step 1: Language -->
     <div id="step-lang">
@@ -399,25 +494,47 @@
       <div class="tagline">AI Receptionist — Mita</div>
       <div class="prompt">Choose your language / ভাষা বেছে নিন</div>
       <div class="lang-row">
-        <button class="lang-pill" onclick="startChat('bn')"><span class="flag">🇧🇩</span>বাংলা</button>
-        <button class="lang-pill" onclick="startChat('en')"><span class="flag">🇬🇧</span>English</button>
+        <button class="lang-pill" onclick="chooseLang('bn')"><span class="flag">🇧🇩</span>বাংলা</button>
+        <button class="lang-pill" onclick="chooseLang('en')"><span class="flag">🇬🇧</span>English</button>
       </div>
     </div>
 
     <!-- Step 2: Chat -->
     <div id="step-chat">
       <div class="chat-header">
-        <div class="agent-av">🤖</div>
+        <div class="agent-av" id="header-av" aria-hidden="true">🤖</div>
         <div>
           <div class="agent-name" id="agent-name">Mita</div>
           <div class="agent-role" id="agent-role">AI Receptionist</div>
         </div>
-        <button class="close-btn" onclick="closeChat()">✕</button>
+        <button class="handoff-btn" id="handoff-btn" onclick="requestHuman()"
+                aria-label="Talk to a person">
+          👤 <span id="handoff-label">Talk to a person</span>
+        </button>
+        <button class="close-btn" onclick="closeChat()" aria-label="Close chat">✕</button>
       </div>
-      <div id="messages"></div>
+
+      <div id="status-banner" class="status-banner" role="status" hidden></div>
+
+      <div id="messages" aria-live="polite" role="log" aria-label="Messages"></div>
+
+      <div id="callback-form" class="callback-form" hidden>
+        <div class="cb-title" id="cb-title"></div>
+        <input id="cb-name" type="text" autocomplete="name" aria-label="Your name"/>
+        <input id="cb-phone" type="tel" inputmode="tel" autocomplete="tel" aria-label="Phone number"/>
+        <textarea id="cb-msg" rows="2" aria-label="Message (optional)"></textarea>
+        <div class="cb-error" id="cb-error" role="alert" hidden></div>
+        <div class="cb-actions">
+          <button id="cb-submit" type="button" onclick="submitCallback()"></button>
+          <button id="cb-cancel" type="button" onclick="hideCallback()"></button>
+        </div>
+      </div>
+
+      <div class="reconnect-note" id="reconnect-note" hidden></div>
+
       <div class="chat-input">
-        <textarea id="msg-input" rows="1" placeholder="Type here..."></textarea>
-        <button class="send-btn" id="send-btn" onclick="sendMsg()">➤</button>
+        <textarea id="msg-input" rows="1" placeholder="Type here..." aria-label="Message"></textarea>
+        <button class="send-btn" id="send-btn" onclick="sendMsg()" aria-label="Send message">➤</button>
       </div>
     </div>
 
@@ -425,151 +542,641 @@
 </div>
 
 <script>
-let LANG = "bn";
-let SID  = null;  // issued by POST /session when the chat starts
-let busy = false;
+"use strict";
 
-const T = {
+/* ══════════════════════════════════════════════════════════════════════════
+   Smile Dental Care — customer chat widget
+   • Mita (AI) answers in Bangla or English.
+   • "Talk to a person" hands the chat to a live human agent.
+   • The transcript survives a page refresh (stored session id + /chat/history).
+
+   All customer/bot/agent text is written with textContent — never innerHTML.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Every user-facing string in one bilingual object ─────────────────────── */
+const STR = {
   bn: {
-    name: "মিতা", role: "AI রিসেপশনিস্ট",
+    personaName: "মিতা",
+    personaRole: "AI রিসেপশনিস্ট",
     placeholder: "বাংলায় লিখুন...",
     welcome: "আস্সালামু আলাইকুম! স্মাইল ডেন্টাল কেয়ারে স্বাগতম। আমি মিতা। কীভাবে সাহায্য করতে পারি? 😊",
+    talkToPerson: "একজন মানুষের সাথে কথা বলুন",
+    you: "আপনি",
+    agentFallback: "এজেন্ট",
+    waiting: n => "একজন এজেন্ট শীঘ্রই যোগ দেবেন (আপনি " + n +
+                  " নম্বরে আছেন)। ততক্ষণ মিতা সাহায্য করতে পারে।",
+    withAgent: name => "আপনি " + name + "-এর সাথে কথা বলছেন",
+    humanBadge: "মানুষ",
+    agentRole: "হিউম্যান এজেন্ট",
+    closed: "এই কথোপকথন শেষ হয়েছে",
+    startNew: "নতুন চ্যাট শুরু করুন",
+    callbackTitle: "আপনার নাম আর নম্বর দিন — আমরা ফোন করে জানাব।",
+    cbName: "আপনার নাম",
+    cbPhone: "ফোন নম্বর",
+    cbMessage: "বার্তা (ঐচ্ছিক)",
+    cbSubmit: "অনুরোধ পাঠান",
+    cbCancel: "বাতিল",
+    cbMissing: "নাম আর ফোন নম্বর দুটোই দরকার।",
+    callbackOk: "✅ ধন্যবাদ! আপনার অনুরোধ পেয়েছি — ক্লিনিক শীঘ্রই ফোন করবে।",
+    reconnecting: "আবার সংযোগ হচ্ছে…",
+    sendError: "বার্তা পাঠানো যায়নি। আবার চেষ্টা করুন।",
     saved: "✅ আপনার অনুরোধ পেয়েছি! ক্লিনিক শীঘ্রই ফোন করে নিশ্চিত করবে।",
   },
   en: {
-    name: "Mita", role: "AI Receptionist",
+    personaName: "Mita",
+    personaRole: "AI Receptionist",
     placeholder: "Type your message...",
     welcome: "Hello! Welcome to Smile Dental Care. I'm Mita, your AI receptionist. How can I help you today? 😊",
+    talkToPerson: "Talk to a person",
+    you: "You",
+    agentFallback: "Agent",
+    waiting: n => "An agent will join shortly (you're number " + n +
+                  " in the queue). Mita can keep helping you meanwhile.",
+    withAgent: name => "You're chatting with " + name,
+    humanBadge: "Human",
+    agentRole: "Human agent",
+    closed: "This chat has ended",
+    startNew: "Start new chat",
+    callbackTitle: "Leave your name and number and we'll call you back.",
+    cbName: "Your name",
+    cbPhone: "Phone number",
+    cbMessage: "Message (optional)",
+    cbSubmit: "Send request",
+    cbCancel: "Cancel",
+    cbMissing: "Please add both your name and phone number.",
+    callbackOk: "✅ Thanks! We've got your request — the clinic will call you shortly.",
+    reconnecting: "reconnecting…",
+    sendError: "Couldn't send that message. Please try again.",
     saved: "✅ Request received! The clinic will confirm shortly.",
   }
 };
 
-function openChat() {
-  document.getElementById("overlay").classList.add("open");
-  document.getElementById("step-lang").style.display = "flex";
-  document.getElementById("step-chat").style.display = "none";
+const SESSION_KEY = "sdc_session_id";
+const LANG_KEY    = "sdc_lang";
+const POLL_FAST   = 3000;    // ms while waiting / with an agent
+const POLL_HIDDEN = 10000;   // ms while the tab is hidden
+const POLL_MAX    = 30000;   // backoff ceiling after errors
+
+const state = {
+  sid: null,
+  lang: "bn",
+  status: "lang",        // lang | bot | waiting | with_agent | closed
+  lastId: 0,
+  seen: new Set(),
+  chatResponded: false,
+  busy: false,
+  pollTimer: null,
+  pollDelay: 0,           // extra backoff on top of the base delay
+  unread: 0,
+  agentName: null,
+  position: null,
+  reconnecting: false,
+};
+
+const $ = id => document.getElementById(id);
+const t = () => STR[state.lang] || STR.en;
+
+/* ── Tiny DOM helpers (textContent only) ──────────────────────────────────── */
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text != null) node.textContent = text;
+  return node;
+}
+function scrollBottom() {
+  const box = $("messages");
+  box.scrollTop = box.scrollHeight;
+}
+function isOpen() {
+  return $("overlay").classList.contains("open");
 }
 
-function closeChat() {
-  document.getElementById("overlay").classList.remove("open");
+/* ── Language + header strings ────────────────────────────────────────────── */
+function applyLangStrings() {
+  const s = t();
+  $("msg-input").placeholder = s.placeholder;
+  $("handoff-label").textContent = s.talkToPerson;
+  $("cb-title").textContent = s.callbackTitle;
+  $("cb-name").placeholder = s.cbName;
+  $("cb-phone").placeholder = s.cbPhone;
+  $("cb-msg").placeholder = s.cbMessage;
+  $("cb-submit").textContent = s.cbSubmit;
+  $("cb-cancel").textContent = s.cbCancel;
+  $("reconnect-note").textContent = s.reconnecting;
+  document.documentElement.lang = state.lang === "bn" ? "bn" : "en";
+  updateHeader();
 }
 
-document.getElementById("overlay").addEventListener("click", e => {
-  if (e.target === document.getElementById("overlay")) closeChat();
-});
-
-async function newSession(lang) {
-  // The server issues unguessable session ids; the widget never invents one.
-  try {
-    const res  = await fetch("/session", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({lang: lang || "bn"})
-    });
-    const data = await res.json();
-    if (data && data.session_id) return data.session_id;
-  } catch (e) { /* fall through to the error path below */ }
-  return null;
+function updateHeader() {
+  const s = t();
+  const onAgent = state.status === "with_agent" && state.agentName;
+  $("header-av").textContent = onAgent ? "🧑‍💼" : "🤖";
+  $("agent-name").textContent = onAgent ? state.agentName : s.personaName;
+  $("agent-role").textContent = onAgent ? s.agentRole : s.personaRole;
 }
 
-async function startChat(lang) {
-  LANG = lang;
-  const t = T[lang];
-  document.getElementById("step-lang").style.display = "none";
-  document.getElementById("step-chat").style.display = "flex";
-  document.getElementById("agent-name").textContent  = t.name;
-  document.getElementById("agent-role").textContent  = t.role;
-  document.getElementById("msg-input").placeholder   = t.placeholder;
-  document.getElementById("messages").innerHTML      = "";
-
-  SID = await newSession(lang);
-
-  addMsg("agent", t.welcome);
+/* ── Status banner + handoff button ───────────────────────────────────────── */
+function updateBanner() {
+  const banner = $("status-banner");
+  banner.className = "status-banner";
+  banner.textContent = "";
+  const s = t();
+  if (state.status === "waiting") {
+    banner.classList.add("waiting");
+    banner.textContent = s.waiting(state.position || 1);
+    banner.hidden = false;
+  } else if (state.status === "with_agent") {
+    banner.classList.add("with_agent");
+    banner.textContent = s.withAgent(state.agentName || s.agentFallback) + " ";
+    banner.appendChild(el("span", "human-badge", s.humanBadge));
+    banner.hidden = false;
+  } else if (state.status === "closed") {
+    banner.classList.add("closed");
+    banner.textContent = s.closed;
+    const btn = el("button", "banner-action", s.startNew);
+    btn.type = "button";
+    btn.onclick = startNewChat;
+    banner.appendChild(btn);
+    banner.hidden = false;
+  } else {
+    banner.hidden = true;
+  }
+  updateHeader();
+  updateHandoffButton();
 }
 
-function addMsg(role, text) {
-  const box  = document.getElementById("messages");
-  const wrap = document.createElement("div");
-  wrap.className = `msg ${role}`;
-  const av  = document.createElement("div");
-  av.className = "msg-av";
-  av.textContent = role === "agent" ? "🤖" : "👤";
-  const bub = document.createElement("div");
-  bub.className = "bubble";
-  bub.textContent = text;
+function updateHandoffButton() {
+  const btn = $("handoff-btn");
+  const blocked = !state.sid || state.status === "waiting"
+                  || state.status === "with_agent" || state.status === "closed";
+  btn.disabled = blocked;
+  $("handoff-label").textContent = t().talkToPerson;
+}
+
+/* ── Message rendering ────────────────────────────────────────────────────── */
+function renderMsg(sender, text, agentName) {
+  const box = $("messages");
+  const wrap = el("div", "msg " + sender);
+
+  if (sender === "system") {
+    wrap.appendChild(el("div", "bubble", text));
+    box.appendChild(wrap);
+    scrollBottom();
+    return;
+  }
+
+  const av = el("div", "msg-av",
+                sender === "customer" ? "👤" : sender === "agent" ? "🧑‍💼" : "🤖");
+  const body = el("div", "msg-body");
+
+  if (sender === "agent") {
+    const name = el("div", "msg-name");
+    name.appendChild(document.createTextNode(agentName || t().agentFallback));
+    name.appendChild(el("span", "human-badge", t().humanBadge));
+    body.appendChild(name);
+  } else if (sender === "bot") {
+    body.appendChild(el("div", "msg-name", t().personaName));
+  }
+
+  body.appendChild(el("div", "bubble", text));
   wrap.appendChild(av);
-  wrap.appendChild(bub);
+  wrap.appendChild(body);
   box.appendChild(wrap);
-  box.scrollTop = box.scrollHeight;
+  scrollBottom();
 }
 
-function addSaved() {
-  const box = document.getElementById("messages");
-  const el  = document.createElement("div");
-  el.className   = "saved-msg";
-  el.textContent = T[LANG].saved;
-  box.appendChild(el);
-  box.scrollTop = box.scrollHeight;
+function renderSaved(text) {
+  $("messages").appendChild(el("div", "saved-msg", text || t().saved));
+  scrollBottom();
+}
+
+function addMessage(m, silent) {
+  if (!m || m.content == null) return;
+  if (m.id != null) {
+    if (state.seen.has(m.id)) return;      // deduplicate by message id
+    state.seen.add(m.id);
+    if (m.id > state.lastId) state.lastId = m.id;
+  }
+  const sender = m.sender_type === "customer" ? "customer"
+               : m.sender_type === "agent"    ? "agent"
+               : m.sender_type === "system"   ? "system" : "bot";
+  renderMsg(sender, m.content, m.agent_name || null);
+  if (!silent && sender === "agent" && !isOpen()) bumpUnread();
 }
 
 function showTyping() {
-  const box = document.getElementById("messages");
-  const el  = document.createElement("div");
-  el.className = "typing-bubble"; el.id = "typing";
-  el.innerHTML = `<div class="msg-av" style="background:linear-gradient(135deg,#1240a8,#1a56db);width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px">🤖</div><div class="dots"><span></span><span></span><span></span></div>`;
-  box.appendChild(el);
-  box.scrollTop = box.scrollHeight;
+  hideTyping();
+  const wrap = el("div", "msg bot typing");
+  wrap.id = "typing";
+  wrap.appendChild(el("div", "msg-av", "🤖"));
+  const body = el("div", "msg-body");
+  body.appendChild(el("div", "msg-name", t().personaName));
+  const dots = el("div", "dots");
+  for (let i = 0; i < 3; i++) dots.appendChild(el("span"));
+  body.appendChild(dots);
+  wrap.appendChild(body);
+  $("messages").appendChild(wrap);
+  scrollBottom();
 }
-
 function hideTyping() {
-  const el = document.getElementById("typing");
-  if (el) el.remove();
+  const node = $("typing");
+  if (node) node.remove();
 }
 
+/* ── Unread badge ─────────────────────────────────────────────────────────── */
+function bumpUnread() {
+  state.unread += 1;
+  const badge = $("unread-badge");
+  badge.textContent = String(state.unread);
+  badge.hidden = false;
+  $("launcher").classList.add("has-unread");
+}
+function clearUnread() {
+  state.unread = 0;
+  $("unread-badge").hidden = true;
+  $("launcher").classList.remove("has-unread");
+}
+
+/* ── Open / close ─────────────────────────────────────────────────────────── */
+function openChat() {
+  $("overlay").classList.add("open");
+  if (state.sid) {
+    $("step-lang").style.display = "none";
+    $("step-chat").style.display = "flex";
+    clearUnread();
+    scrollBottom();
+    $("msg-input").focus();
+  } else {
+    $("step-lang").style.display = "flex";
+    $("step-chat").style.display = "none";
+  }
+}
+function closeChat() {
+  $("overlay").classList.remove("open");
+}
+$("overlay").addEventListener("click", e => {
+  if (e.target === $("overlay")) closeChat();
+});
+
+/* ── Session helpers ──────────────────────────────────────────────────────── */
+function newSessionState(lang) {
+  state.status = "bot";
+  state.lastId = 0;
+  state.seen = new Set();
+  state.chatResponded = false;
+  state.agentName = null;
+  state.position = null;
+  state.pollDelay = 0;
+  $("messages").textContent = "";
+  hideCallback();
+  hideTyping();
+}
+function clearSession() {
+  state.sid = null;
+  sessionStorage.removeItem(SESSION_KEY);
+}
+function handleExpiredSession() {
+  stopPolling();
+  clearSession();
+  state.status = "lang";
+  $("step-chat").style.display = "none";
+  $("step-lang").style.display = "flex";
+}
+
+/* ── Start / choose language ──────────────────────────────────────────────── */
+async function chooseLang(lang) {
+  state.lang = lang;
+  sessionStorage.setItem(LANG_KEY, lang);
+  newSessionState(lang);
+  applyLangStrings();
+  $("step-lang").style.display = "none";
+  $("step-chat").style.display = "flex";
+
+  try {
+    const res = await fetch("/session", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lang })
+    });
+    const data = await res.json();
+    if (data && data.session_id) {
+      state.sid = data.session_id;
+      sessionStorage.setItem(SESSION_KEY, data.session_id);
+    }
+  } catch (e) { /* stay usable offline; the id is created on first send */ }
+
+  renderMsg("bot", t().welcome, null);
+  updateBanner();
+  maybeStartPolling();
+  $("msg-input").focus();
+}
+
+/* ── Sending a message ────────────────────────────────────────────────────── */
 async function sendMsg() {
-  if (busy) return;
-  const input = document.getElementById("msg-input");
-  const text  = input.value.trim();
+  if (state.busy) return;
+  const input = $("msg-input");
+  const text = input.value.trim();
   if (!text) return;
+  if (!state.sid) {
+    // The session creation failed earlier — try once more before giving up.
+    try {
+      const r = await fetch("/session", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lang: state.lang })
+      });
+      const d = await r.json();
+      if (d && d.session_id) {
+        state.sid = d.session_id;
+        sessionStorage.setItem(SESSION_KEY, d.session_id);
+      }
+    } catch (e) { /* fall through */ }
+    if (!state.sid) { renderMsg("system", t().sendError, null); return; }
+  }
 
   input.value = "";
   input.style.height = "auto";
-  addMsg("user", text);
+  renderMsg("customer", text, null);
 
-  if (!SID) SID = await newSession(LANG);
+  state.busy = true;
+  $("send-btn").disabled = true;
+  const expectBot = state.status !== "with_agent";
+  if (expectBot) showTyping();
 
-  busy = true;
-  document.getElementById("send-btn").disabled = true;
-  showTyping();
-
+  let data = null;
   try {
-    const res  = await fetch("/chat", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({session_id:SID, message:text, lang:LANG})
+    const res = await fetch("/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: state.sid, message: text, lang: state.lang })
     });
-    const data = await res.json();
-    hideTyping();
-    addMsg("agent", data.reply);
-    if (data.appointment_saved) addSaved();
-  } catch(e) {
-    hideTyping();
-    addMsg("agent", LANG === "bn" ? "সমস্যা হয়েছে। আবার চেষ্টা করুন।" : "Something went wrong. Please try again.");
+    data = await res.json();
+  } catch (e) { data = null; }
+
+  hideTyping();
+  state.busy = false;
+  $("send-btn").disabled = false;
+
+  if (!data) { renderMsg("system", t().sendError, null); input.focus(); return; }
+  if (data.error === "invalid_session") { handleExpiredSession(); return; }
+
+  if (data.mode === "agent") {
+    // A human owns the chat — no bot reply is coming; it arrives via polling.
+    state.chatResponded = true;
+    state.status = "with_agent";
+    updateBanner();
+    maybeStartPolling();
+    input.focus();
+    return;
   }
 
-  busy = false;
-  document.getElementById("send-btn").disabled = false;
+  if (data.reply) renderMsg("bot", data.reply, null);
+  state.chatResponded = true;              // bot mode needs no more polling
+  if (data.appointment_saved) renderSaved();
+  if (data.handoff_queued) state.status = "waiting";
+  if (data.callback_offered) showCallback();
+  updateBanner();
+  maybeStartPolling();
   input.focus();
 }
 
-// Enter to send, Shift+Enter for new line
-document.getElementById("msg-input").addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+/* ── Handoff ("Talk to a person") ─────────────────────────────────────────── */
+async function requestHuman() {
+  if (!state.sid) return;
+  if (state.status === "waiting" || state.status === "with_agent") return;
+  $("handoff-btn").disabled = true;
+
+  let data = null;
+  try {
+    const res = await fetch("/handoff", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: state.sid, lang: state.lang })
+    });
+    data = await res.json();
+  } catch (e) { data = null; }
+
+  if (data && data.error === "invalid_session") { handleExpiredSession(); return; }
+
+  if (data && data.queued) {
+    state.status = data.status || "waiting";
+    if (data.position != null) state.position = data.position;
+    updateBanner();
+    maybeStartPolling();                     // picks up the server's queue line
+  } else {
+    // Nobody is online — offer the callback form honestly.
+    showCallback();
+    updateHandoffButton();
+  }
+}
+
+/* ── Callback form ────────────────────────────────────────────────────────── */
+function showCallback() {
+  $("callback-form").hidden = false;
+  const err = $("cb-error");
+  err.hidden = true;
+  err.textContent = "";
+}
+function hideCallback() {
+  $("callback-form").hidden = true;
+}
+async function submitCallback() {
+  const name = $("cb-name").value.trim();
+  const phone = $("cb-phone").value.trim();
+  const message = $("cb-msg").value.trim();
+  const err = $("cb-error");
+  err.hidden = true;
+
+  if (!name || !phone) {
+    err.textContent = t().cbMissing;
+    err.hidden = false;
+    return;
+  }
+  $("cb-submit").disabled = true;
+  let data = null;
+  try {
+    const res = await fetch("/callback", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: state.sid, lang: state.lang,
+                             name, phone, message })
+    });
+    data = await res.json();
+    if (res.ok && data && data.ok) {
+      hideCallback();
+      $("cb-name").value = "";
+      $("cb-phone").value = "";
+      $("cb-msg").value = "";
+      renderSaved(t().callbackOk);
+      $("cb-submit").disabled = false;
+      return;
+    }
+  } catch (e) { data = null; }
+  $("cb-submit").disabled = false;
+  err.textContent = (data && data.reply) ? data.reply : t().sendError;
+  err.hidden = false;
+}
+
+/* ── New chat ─────────────────────────────────────────────────────────────── */
+async function startNewChat() {
+  stopPolling();
+  const old = state.sid;
+  try {
+    const res = await fetch("/reset", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: old, lang: state.lang })
+    });
+    const data = await res.json();
+    if (data && data.session_id) {
+      state.sid = data.session_id;
+      sessionStorage.setItem(SESSION_KEY, data.session_id);
+    }
+  } catch (e) { /* keep the old id; a reset is best-effort */ }
+
+  newSessionState(state.lang);
+  applyLangStrings();
+  renderMsg("bot", t().welcome, null);
+  updateBanner();
+  maybeStartPolling();
+}
+
+/* ── Polling ──────────────────────────────────────────────────────────────── */
+function shouldPoll() {
+  if (!state.sid) return false;
+  if (state.status === "closed" || state.status === "lang") return false;
+  if (state.status === "waiting" || state.status === "with_agent") return true;
+  return !state.chatResponded;             // bot mode: only until first /chat reply
+}
+function currentDelay() {
+  const base = document.hidden ? POLL_HIDDEN : POLL_FAST;
+  return Math.max(base, state.pollDelay);
+}
+function schedulePoll(delay) {
+  if (state.pollTimer) return;
+  state.pollTimer = setTimeout(pollLoop, delay);
+}
+function maybeStartPolling() {
+  if (!state.pollTimer && shouldPoll()) schedulePoll(0);
+}
+function stopPolling() {
+  if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+}
+function showReconnect(on) {
+  state.reconnecting = on;
+  $("reconnect-note").hidden = !on;
+}
+
+async function pollOnce() {
+  if (!state.sid) return false;
+  let res;
+  try {
+    res = await fetch("/chat/poll?session_id=" + encodeURIComponent(state.sid) +
+                      "&after_id=" + encodeURIComponent(state.lastId));
+  } catch (e) { return false; }
+  if (res.status === 400) { handleExpiredSession(); return false; }
+  if (res.status === 429) { return true; }  // rate limited: keep our cadence
+  if (!res.ok) return false;
+  let data;
+  try { data = await res.json(); } catch (e) { return false; }
+  applyPollData(data);
+  return true;
+}
+
+function applyPollData(data) {
+  if (data.status) state.status = data.status;
+  if (data.position != null) state.position = data.position;
+  if (data.agent_name) state.agentName = data.agent_name;
+  else if (state.status !== "with_agent") state.agentName = null;
+  (data.messages || []).forEach(m => addMessage(m, false));
+  updateBanner();
+}
+
+async function pollLoop() {
+  state.pollTimer = null;
+  if (!shouldPoll()) return;
+  const ok = await pollOnce();
+  if (ok) {
+    state.pollDelay = 0;
+    showReconnect(false);
+  } else {
+    state.pollDelay = state.pollDelay
+      ? Math.min(state.pollDelay * 2, POLL_MAX)
+      : POLL_FAST;                          // first failure: start backing off
+    showReconnect(true);
+  }
+  if (shouldPoll()) schedulePoll(currentDelay());
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && shouldPoll()) {
+    if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+    schedulePoll(0);                        // speed back up when the tab returns
+  }
 });
 
-// Auto-resize textarea
-document.getElementById("msg-input").addEventListener("input", function() {
+/* ── Restore after a refresh ──────────────────────────────────────────────── */
+async function restoreHistory() {
+  if (!state.sid) return false;
+  let res;
+  try {
+    res = await fetch("/chat/history?session_id=" + encodeURIComponent(state.sid));
+  } catch (e) { return false; }
+  if (res.status === 400) { clearSession(); return false; }
+  if (!res.ok) return false;
+  let data;
+  try { data = await res.json(); } catch (e) { return false; }
+
+  $("messages").textContent = "";
+  state.seen = new Set();
+  state.lastId = data.last_id || 0;
+  state.status = data.status || "bot";
+  state.agentName = data.agent_name || null;
+  state.position = data.position != null ? data.position : null;
+  state.chatResponded = (data.messages || []).length > 0;
+  state.pollDelay = 0;
+  if (data.lang) {
+    state.lang = data.lang;
+    sessionStorage.setItem(LANG_KEY, data.lang);
+  }
+  applyLangStrings();
+
+  if (!data.messages || data.messages.length === 0) {
+    renderMsg("bot", t().welcome, null);
+  } else {
+    data.messages.forEach(m => addMessage(m, true));
+  }
+  updateBanner();
+  maybeStartPolling();
+  return true;
+}
+
+/* ── Boot ─────────────────────────────────────────────────────────────────── */
+async function initWidget() {
+  applyLangStrings();
+  const sid = sessionStorage.getItem(SESSION_KEY);
+  const lang = sessionStorage.getItem(LANG_KEY);
+  if (sid && lang) {
+    state.sid = sid;
+    state.lang = lang;
+    applyLangStrings();
+    const ok = await restoreHistory();
+    if (!ok) {
+      // Stored session is no longer valid — ask for the language again.
+      clearSession();
+      state.status = "lang";
+    }
+  }
+  updateHandoffButton();
+}
+
+/* ── Input behaviour ──────────────────────────────────────────────────────── */
+$("msg-input").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+});
+$("msg-input").addEventListener("input", function () {
   this.style.height = "auto";
   this.style.height = Math.min(this.scrollHeight, 100) + "px";
 });
+$("cb-phone").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); submitCallback(); }
+});
+
+initWidget();
 </script>
 </body>
 </html>

@@ -67,13 +67,19 @@ Customers can move from the AI chatbot to a live human agent. A conversation
 moves through `bot → waiting → with_agent → closed`:
 
 - The widget asks the server for a session id (`POST /session`) instead of
-  inventing one; ids are unguessable and validated on every request.
+  inventing one; ids are unguessable and validated on every request. The id and
+  language are kept in `sessionStorage`, so **a refresh restores the transcript**
+  via `GET /chat/history`.
 - When a customer asks for a human (button or the AI's `HANDOFF_REQUEST`
   marker), the conversation is queued **only if** an agent has a fresh
   heartbeat. Otherwise the customer is offered a callback instead.
 - Agents log in at `/agent/login` (same `admins` table) and use the JSON API
   under `/agent/api` (heartbeat, queue, conversation, accept/message/handback/
   close). Every agent POST needs the `X-CSRF-Token` header.
+- Every customer request stamps `conversations.customer_last_seen`, so the queue
+  reports `customer_away` (silent for `customer_away_seconds`); a `waiting`
+  conversation whose customer disappears is closed with a "customer left"
+  system message after `customer_left_seconds`.
 - If nobody accepts within `handoff_timeout_minutes`, the bot takes over again;
   idle `with_agent` chats close after `idle_close_minutes`. These run lazily
   from the polling endpoints — no background threads.
@@ -86,12 +92,29 @@ Set `DEMO_SEED=1` in the environment to seed two demo agents (never done
 otherwise).
 
 Timing settings (editable in `settings`): `handoff_timeout_minutes` (5),
-`agent_online_window_seconds` (45), `idle_close_minutes` (30).
+`agent_online_window_seconds` (45), `idle_close_minutes` (30),
+`customer_away_seconds` (45), `customer_left_seconds` (120).
+
+## Customer widget
+
+`templates/index.html` is a single page with inline CSS/JS (no build tools).
+The chat popup:
+
+- stores `session_id` + `lang` in `sessionStorage` and restores the transcript
+  from `/chat/history` on load;
+- polls `/chat/poll` every ~3 s while `waiting`/`with_agent` (10 s when the tab
+  is hidden), backs off on errors and shows a small "reconnecting…" note;
+- shows a status banner per state and a persistent **Talk to a person** button;
+- renders messages by `sender_type` (customer right; bot, agent, system distinct)
+  and only ever writes text with `textContent`.
+
+See `manual_test_widget.md` for a hands-on script (one browser + `curl` as the
+agent).
 
 ## Tests
 ```bash
 python test_booking.py    # 30 checks — booking pipeline
-python test_handoff.py    # 52 checks — sessions, state machine, agent API
+python test_handoff.py    # 69 checks — sessions, state machine, agent API, widget API
 ```
 Both run against a throwaway database with a mocked AI (normal booking, taken
 slot, invalid phone, non-working day, past date, malformed marker, atomic
@@ -107,6 +130,7 @@ dental_v4/
 ├── create_agent.py     ← Create a human-agent account
 ├── test_booking.py     ← Booking pipeline tests (mocked AI, temp DB)
 ├── test_handoff.py     ← Human-handoff tests (mocked AI, temp DB)
+├── manual_test_widget.md ← Hands-on script for the browser widget
 ├── clinic.db           ← SQLite database (gitignored, auto-created)
 ├── config.example.json ← Template for config.json (safe to commit)
 ├── config.json         ← Your real secrets (gitignored)
@@ -127,6 +151,7 @@ Public (customer widget):
 | POST | `/session` | Issue a new session id + conversation |
 | POST | `/chat` | Send a message; returns bot reply, booking/handoff flags |
 | GET  | `/chat/poll?session_id=&after_id=` | New visible messages + status |
+| GET  | `/chat/history?session_id=` | Full transcript + status (restore after refresh) |
 | POST | `/handoff` | "Talk to a human" button |
 | POST | `/callback` | Leave name + phone for a callback |
 | POST | `/reset` | Close the current conversation, issue a new id |
@@ -135,8 +160,8 @@ Agent (login + CSRF header required):
 | Method | Path | Notes |
 | --- | --- | --- |
 | POST | `/agent/api/heartbeat` | `{is_online: true/false}` |
-| GET  | `/agent/api/queue` | Waiting list + my active chats |
-| GET  | `/agent/api/conversation/<id>?after_id=` | Full transcript |
+| GET  | `/agent/api/queue` | Waiting list + my active chats (`customer_away`) |
+| GET  | `/agent/api/conversation/<id>?after_id=` | Transcript + linked appointments/callbacks |
 | POST | `/agent/api/conversation/<id>/accept` | Claim a waiting chat |
 | POST | `/agent/api/conversation/<id>/message` | Send a message |
 | POST | `/agent/api/conversation/<id>/handback` | Return to the bot |

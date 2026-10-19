@@ -322,6 +322,115 @@ check("transcript contains a system message", has_system)
 check("AI history excludes system messages",
       all(m["role"] in ("user", "assistant") for m in history))
 
+# 21. customer_last_seen is stamped on /chat and /chat/poll (A1) ---------------
+sid = new_session()
+conv = db.get_or_create_conversation(sid, "en")
+set_times(conv["id"], customer_last_seen=None)
+post_chat("hello", sid)
+check("A1: /chat stamps customer_last_seen",
+      bool(db.get_conversation(conv["id"])["customer_last_seen"]))
+set_times(conv["id"], customer_last_seen=None)
+client.get("/chat/poll", query_string={"session_id": sid, "after_id": 0})
+check("A1: /chat/poll stamps customer_last_seen",
+      bool(db.get_conversation(conv["id"])["customer_last_seen"]))
+
+# 22. A silent waiting customer is closed as "customer left" (A2) -------------
+db.set_setting("customer_left_seconds", "120")
+sid, cid = make_waiting(agent_a)
+now = db.dhaka_now()
+set_times(cid, handoff_requested_at=now.isoformat(),
+          customer_last_seen=(now - datetime.timedelta(seconds=200)).isoformat())
+db.run_housekeeping()
+check("A2: silent waiting customer -> closed", conv_status(cid) == "closed")
+with db._connect() as conn:
+    left_msg = conn.execute(
+        "SELECT content FROM chat_messages WHERE conversation_id=? "
+        "AND sender_type='system' ORDER BY id DESC LIMIT 1", (cid,)).fetchone()
+check("A2: stores a 'customer left' system message",
+      left_msg is not None and "customer left" in left_msg["content"].lower())
+
+# A waiting customer who is still present is left alone.
+sid, cid = make_waiting(agent_a)
+set_times(cid, handoff_requested_at=db.dhaka_now().isoformat(),
+          customer_last_seen=db.dhaka_now().isoformat())
+db.run_housekeeping()
+check("A2: present waiting customer stays waiting", conv_status(cid) == "waiting")
+
+# 23. Queue reports customer_away for waiting and with_agent chats (A2) -------
+db.set_setting("customer_away_seconds", "45")
+cli_q, _tok = agent_client("agent_a")
+
+sid_away, cid_away = make_waiting(agent_a)
+now = db.dhaka_now()
+set_times(cid_away, handoff_requested_at=now.isoformat(),
+          customer_last_seen=(now - datetime.timedelta(seconds=90)).isoformat())
+q = cli_q.get("/agent/api/queue").get_json()
+item = next((w for w in q["waiting"] if w["id"] == cid_away), None)
+check("A2: stale waiting customer flagged customer_away",
+      item is not None and item.get("customer_away") is True)
+
+sid_here, cid_here = make_waiting(agent_a)
+set_times(cid_here, handoff_requested_at=db.dhaka_now().isoformat(),
+          customer_last_seen=db.dhaka_now().isoformat())
+q = cli_q.get("/agent/api/queue").get_json()
+here = next((w for w in q["waiting"] if w["id"] == cid_here), None)
+check("A2: present waiting customer not flagged away",
+      here is not None and here.get("customer_away") is False)
+
+# A with_agent chat also carries the flag.
+sid_mine, cid_mine = make_waiting(agent_a)
+db.accept_conversation(cid_mine, agent_a)
+now = db.dhaka_now()
+set_times(cid_mine, last_message_at=now.isoformat(),
+          customer_last_seen=(now - datetime.timedelta(seconds=90)).isoformat())
+q = cli_q.get("/agent/api/queue").get_json()
+mine = next((c for c in q["mine"] if c["id"] == cid_mine), None)
+check("A2: with_agent chat also reports customer_away",
+      mine is not None and mine.get("customer_away") is True)
+
+# 24. GET /agent/api/queue runs housekeeping (A2) -----------------------------
+sid, cid = make_waiting(agent_a)
+now = db.dhaka_now()
+set_times(cid, handoff_requested_at=now.isoformat(),
+          customer_last_seen=(now - datetime.timedelta(seconds=200)).isoformat())
+cli_q.get("/agent/api/queue")
+check("A2: queue endpoint triggers housekeeping", conv_status(cid) == "closed")
+
+# 25. /chat/history restores the customer-visible transcript (A3) -------------
+sid = new_session()
+state["reply"] = "Sure, happy to help."
+post_chat("Hi there", sid)
+conv = db.get_or_create_conversation(sid, "en")
+db.add_message(conv["id"], "agent", "Hello, this is Aisha.", agent_id=agent_a)
+r = client.get("/chat/history", query_string={"session_id": sid})
+body = r.get_json()
+check("A3: /chat/history returns 200", r.status_code == 200)
+types = {m["sender_type"] for m in body.get("messages", [])}
+check("A3: history includes customer + bot + agent messages",
+      {"customer", "bot", "agent"} <= types)
+check("A3: history carries the agent display name",
+      any(m["sender_type"] == "agent" and m["agent_name"] == "Aisha"
+          for m in body["messages"]))
+check("A3: history reports the current status", body.get("status") == "bot")
+check("A3: history has a last_id", isinstance(body.get("last_id"), int))
+r = client.get("/chat/history", query_string={"session_id": "Z" * 30})
+check("A3: history rejects an unknown session (400)", r.status_code == 400)
+
+# 26. Agent conversation detail links appointments + callbacks (A4) -----------
+sid, cid = make_waiting(agent_a)
+doctor = db.list_doctors(active_only=True)[0]
+days = db.get_next_available_slots(doctor["id"], days=21)
+slot_date, slot_time = days[0]["date"], days[0]["slots"][0]
+appt_id = db.book_appointment("Linked Patient", "01712345678", doctor["id"],
+                              None, slot_date, slot_time, session_id=sid)
+db.create_callback_request(cid, "Linked Patient", "01712345678", "please call")
+cli_d, _tok = agent_client("agent_a")
+body = cli_d.get("/agent/api/conversation/%d" % cid).get_json()
+check("A4: detail includes the session's appointment",
+      any(a["id"] == appt_id for a in body.get("appointments", [])))
+check("A4: detail includes the conversation's callbacks",
+      len(body.get("callbacks", [])) >= 1)
+
 # ─── Summary ──────────────────────────────────────────────────────────────────
 passed = sum(1 for _, ok in results if ok)
 print()

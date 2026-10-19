@@ -211,6 +211,17 @@ def _public_appt(appt):
     }
 
 
+def _shape_message(m):
+    """Shape one chat row for the customer widget (poll + history)."""
+    return {
+        "id":          m["id"],
+        "sender_type": m["sender_type"],
+        "content":     m["content"],
+        "created_at":  m["created_at"],
+        "agent_name":  m.get("agent_display_name"),
+    }
+
+
 # ─── AI CHAT ──────────────────────────────────────────────────────────────────
 def _openrouter_chat(messages, lang="bn"):
     """Send ``messages`` to OpenRouter and return the reply text.
@@ -493,6 +504,9 @@ def chat():
                                   else "Your session has expired. Please refresh the page."),
                         "error": "invalid_session"}), 400
 
+    # The customer just spoke to us — remember they are still present.
+    db.touch_customer_seen(sid)
+
     if not msg:
         return jsonify({"reply": ("দয়া করে একটা মেসেজ লিখুন।" if lang == "bn"
                                   else "Please type a message."),
@@ -592,6 +606,7 @@ def handoff():
     if _rate_limited(_client_ip()):
         return jsonify({"error": "rate_limited"}), 429
 
+    db.touch_customer_seen(sid)
     conv = db.get_or_create_conversation(sid, lang)
     if conv["status"] == "with_agent":
         return jsonify({"queued": True, "position": 0, "status": "with_agent",
@@ -626,6 +641,7 @@ def callback():
     if _rate_check(_callback_buckets, _client_ip(), CALLBACK_RATE_LIMIT):
         return jsonify({"error": "rate_limited"}), 429
 
+    db.touch_customer_seen(sid)
     name    = (data.get("name") or "").strip()
     phone   = (data.get("phone") or "").strip()
     message = (data.get("message") or "").strip()
@@ -655,6 +671,8 @@ def chat_poll():
     if _rate_check(_poll_buckets, sid, POLL_RATE_LIMIT, 60):
         return jsonify({"error": "rate_limited"}), 429
 
+    # Touch before housekeeping: a polling widget proves the customer is present.
+    db.touch_customer_seen(sid)
     db.run_housekeeping()
     conv = db.get_or_create_conversation(sid)
     data = db.get_conversation_with_messages(conv["id"], after_id=after_id)
@@ -668,13 +686,7 @@ def chat_poll():
 
     payload = {
         "status": status,
-        "messages": [{
-            "id": m["id"],
-            "sender_type": m["sender_type"],
-            "content": m["content"],
-            "created_at": m["created_at"],
-            "agent_name": m.get("agent_display_name"),
-        } for m in visible],
+        "messages": [_shape_message(m) for m in visible],
         "last_id": last_id,
         "agent_name": (data["conversation"].get("agent_display_name")
                        if status == "with_agent" else None),
@@ -683,6 +695,47 @@ def chat_poll():
     if status == "waiting":
         payload["position"] = db.queue_position(conv["id"])
     return jsonify(payload)
+
+
+@app.route("/chat/history")
+def chat_history():
+    """Return the customer-visible transcript so the widget can restore itself.
+
+    Used on page load after a refresh: it returns the latest conversation for
+    the session (including a closed one) with every message the customer saw —
+    customer, bot, agent and system — plus the current status and queue position.
+    Same validation and rate limiting as ``/chat/poll``.
+    """
+    sid = request.args.get("session_id", "")
+
+    if not _valid_session_id(sid) or not db.session_exists(sid):
+        return jsonify({"error": "invalid_session"}), 400
+    if _rate_check(_poll_buckets, sid, POLL_RATE_LIMIT, 60):
+        return jsonify({"error": "rate_limited"}), 429
+
+    db.touch_customer_seen(sid)
+    db.run_housekeeping()
+
+    conv = db.get_latest_conversation(sid)
+    if not conv:
+        return jsonify({"status": "none", "messages": [], "last_id": 0,
+                        "conversation_id": None, "agent_name": None,
+                        "position": None, "lang": None})
+
+    data = db.get_conversation_with_messages(conv["id"])
+    messages = data["messages"] if data else []
+    status = conv["status"]
+    last_id = max([m["id"] for m in messages] + [0])
+    return jsonify({
+        "status": status,
+        "messages": [_shape_message(m) for m in messages],
+        "last_id": last_id,
+        "conversation_id": conv["id"],
+        "lang": conv.get("lang"),
+        "agent_name": (data["conversation"].get("agent_display_name")
+                       if data and status == "with_agent" else None),
+        "position": db.queue_position(conv["id"]) if status == "waiting" else None,
+    })
 
 
 @app.route("/reset", methods=["POST"])
@@ -901,6 +954,10 @@ def agent_conversation(cid):
         return jsonify({"error": "not_found"}), 404
     if not _agent_can_view(data["conversation"]):
         return jsonify({"error": "forbidden"}), 403
+    # Attach anything the customer left behind: bookings + callback requests.
+    data["appointments"] = db.list_appointments_by_session(
+        data["conversation"].get("session_id"))
+    data["callbacks"] = db.list_callback_requests_for_conversation(cid)
     return jsonify(data)
 
 

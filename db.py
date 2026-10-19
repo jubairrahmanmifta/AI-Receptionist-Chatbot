@@ -173,7 +173,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     handoff_requested_at TEXT,
     accepted_at         TEXT,
     closed_at           TEXT,
-    last_message_at     TEXT
+    last_message_at     TEXT,
+    customer_last_seen  TEXT             -- last time the customer's widget spoke to us
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_session
@@ -238,6 +239,9 @@ SEED_DATA = {
         "handoff_timeout_minutes": "5",
         "agent_online_window_seconds": "45",
         "idle_close_minutes": "30",
+        # How long a silent customer is considered "away" / "gone" while queued.
+        "customer_away_seconds": "45",
+        "customer_left_seconds": "120",
     },
     "doctors": [
         {
@@ -341,6 +345,15 @@ def _migrate_columns():
             "ON chat_messages(conversation_id)"
         )
 
+        # Track the last time the customer's widget reached the server, so a
+        # queued conversation can be detected as abandoned (customer left).
+        conv_cols = _table_columns(conn, "conversations")
+        if "customer_last_seen" not in conv_cols:
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN customer_last_seen TEXT"
+            )
+            print("[db] Added column conversations.customer_last_seen")
+
 
 def _seed_missing_settings():
     """Insert handoff settings that are absent, leaving existing values alone."""
@@ -348,6 +361,8 @@ def _seed_missing_settings():
         "handoff_timeout_minutes": "5",
         "agent_online_window_seconds": "45",
         "idle_close_minutes": "30",
+        "customer_away_seconds": "45",
+        "customer_left_seconds": "120",
     }
     with _connect() as conn:
         existing = {r["key"] for r in conn.execute("SELECT key FROM settings")}
@@ -1042,6 +1057,10 @@ CONVERSATION_CLOSED_MESSAGE = (
     "This conversation has been closed.",
     "এই কথোপকথনটি বন্ধ করা হয়েছে।",
 )
+CUSTOMER_LEFT_MESSAGE = (
+    "Customer left the chat — closed after inactivity.",
+    "গ্রাহক চ্যাট ছেড়ে চলে গেছেন — নিষ্ক্রিয়তার কারণে বন্ধ করা হলো।",
+)
 
 
 def _msg(conversation, en, bn):
@@ -1099,6 +1118,38 @@ def get_current_conversation(session_id):
             (session_id,),
         ).fetchone()
     return dict(row) if row else None
+
+
+def get_latest_conversation(session_id):
+    """Return the newest conversation for a session (closed or not), or ``None``.
+
+    Used to restore the widget after a page refresh: unlike
+    :func:`get_current_conversation` this also returns a closed conversation, so
+    the widget can show its final state.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM conversations
+               WHERE session_id = ? ORDER BY id DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def touch_customer_seen(session_id):
+    """Record that the customer's widget just reached the server.
+
+    Called on every ``/chat``, ``/chat/poll``, ``/chat/history`` and ``/handoff``
+    request for a session. Returns the number of open conversations updated.
+    """
+    now = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            """UPDATE conversations SET customer_last_seen = ?
+               WHERE session_id = ? AND status != 'closed'""",
+            (now, session_id),
+        )
+        return cur.rowcount
 
 
 def session_exists(session_id):
@@ -1342,6 +1393,8 @@ def close_conversation(conversation_id, by="system"):
 def run_housekeeping():
     """Apply time-based transitions lazily (no background threads).
 
+    - ``waiting`` whose customer has not been seen for more than
+      ``customer_left_seconds`` -> ``closed`` (customer left).
     - ``waiting`` longer than ``handoff_timeout_minutes`` -> back to ``bot``
       with a system message offering a callback.
     - ``with_agent`` idle longer than ``idle_close_minutes`` -> ``closed``.
@@ -1350,8 +1403,34 @@ def run_housekeeping():
     """
     now = dhaka_now()
     now_iso = now.isoformat()
-    timed_out = closed = 0
+    timed_out = closed = left = 0
     with _connect_tx() as conn:
+        # A waiting customer who stopped reaching the server (closed the tab) is
+        # treated as gone and the conversation is closed.
+        try:
+            gone = int(float(_connection_setting(conn, "customer_left_seconds", 120)))
+        except (TypeError, ValueError):
+            gone = 120
+        gone_cutoff = (now - datetime.timedelta(seconds=gone)).isoformat()
+        gone_rows = conn.execute(
+            """SELECT * FROM conversations
+               WHERE status = 'waiting'
+                 AND customer_last_seen IS NOT NULL
+                 AND customer_last_seen <= ?""",
+            (gone_cutoff,),
+        ).fetchall()
+        for conv in gone_rows:
+            conn.execute(
+                "UPDATE conversations SET status = 'closed', agent_id = NULL, "
+                "closed_at = ?, last_message_at = ? WHERE id = ?",
+                (now_iso, now_iso, conv["id"]),
+            )
+            _insert_message(
+                conn, conv["id"], conv["session_id"], "system",
+                _msg(conv, *CUSTOMER_LEFT_MESSAGE), created_at=now_iso,
+            )
+            left += 1
+
         try:
             timeout = int(float(_connection_setting(conn, "handoff_timeout_minutes", 5)))
         except (TypeError, ValueError):
@@ -1396,7 +1475,7 @@ def run_housekeeping():
                 _msg(conv, *IDLE_CLOSE_MESSAGE), created_at=now_iso,
             )
             closed += 1
-    return {"timed_out": timed_out, "idle_closed": closed}
+    return {"timed_out": timed_out, "idle_closed": closed, "customer_left": left}
 
 
 def create_callback_request(conversation_id, name, phone, message):
@@ -1428,6 +1507,30 @@ def list_callback_requests(status=None):
         return _rows_to_dicts(conn.execute(query, params).fetchall())
 
 
+def list_callback_requests_for_conversation(conversation_id):
+    """Return the callback requests left against a conversation."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM callback_requests
+               WHERE conversation_id = ? ORDER BY id DESC""",
+            (conversation_id,),
+        ).fetchall()
+    return _rows_to_dicts(rows)
+
+
+def list_appointments_by_session(session_id):
+    """Return appointments booked through a customer session (newest first)."""
+    if not session_id:
+        return []
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM appointments
+               WHERE session_id = ? ORDER BY id DESC""",
+            (session_id,),
+        ).fetchall()
+    return _rows_to_dicts(rows)
+
+
 def _wait_seconds(since_iso, now):
     """Return whole seconds between an ISO timestamp and ``now`` (>= 0)."""
     if not since_iso:
@@ -1439,11 +1542,28 @@ def _wait_seconds(since_iso, now):
     return max(0, int((now - since).total_seconds()))
 
 
+def _is_away(last_seen_iso, now, threshold_seconds):
+    """Return True when ``last_seen_iso`` is older than ``threshold_seconds``.
+
+    A missing timestamp counts as "not away" (unknown), so legacy rows are not
+    flagged.
+    """
+    if not last_seen_iso:
+        return False
+    return _wait_seconds(last_seen_iso, now) > threshold_seconds
+
+
 def _conversation_summaries(rows, now):
-    """Attach last-message preview and wait time to conversation rows."""
+    """Attach last-message preview, wait time and customer-away flag to rows."""
+    try:
+        away_seconds = int(float(get_setting("customer_away_seconds", 45)))
+    except (TypeError, ValueError):
+        away_seconds = 45
     out = _rows_to_dicts(rows)
     for conv in out:
         conv["wait_seconds"] = _wait_seconds(conv.get("handoff_requested_at"), now)
+        conv["customer_away"] = _is_away(conv.get("customer_last_seen"),
+                                         now, away_seconds)
     return out
 
 
