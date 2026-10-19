@@ -431,6 +431,76 @@ check("A4: detail includes the session's appointment",
 check("A4: detail includes the conversation's callbacks",
       len(body.get("callbacks", [])) >= 1)
 
+# 27. Agent callback API (A1) -------------------------------------------------
+cb_id = db.create_callback_request(cid, "Caller One", "01712345678", "call me back")
+cli_c, tok_c = agent_client("agent_a")
+
+r = app.app.test_client().get("/agent/api/callbacks")
+check("A1: callbacks require login (401)", r.status_code == 401)
+
+r = cli_c.get("/agent/api/callbacks")
+body = r.get_json()
+check("A1: callbacks list returns 200", r.status_code == 200)
+found = [c for c in body.get("callbacks", []) if c["id"] == cb_id]
+check("A1: list includes the new callback with status 'new'",
+      bool(found) and found[0]["status"] == "new")
+ids = [c["id"] for c in body.get("callbacks", [])]
+check("A1: callbacks are newest first", ids == sorted(ids, reverse=True))
+
+r = cli_c.post("/agent/api/callbacks/%d/status" % cb_id, json={"status": "contacted"})
+check("A1: status update needs CSRF (403)", r.status_code == 403)
+
+r = cli_c.post("/agent/api/callbacks/%d/status" % cb_id,
+               json={"status": "bogus"}, headers={"X-CSRF-Token": tok_c})
+check("A1: bad status rejected (400)", r.status_code == 400)
+
+r = cli_c.post("/agent/api/callbacks/%d/status" % cb_id,
+               json={"status": "contacted"}, headers={"X-CSRF-Token": tok_c})
+check("A1: valid status update ok", r.status_code == 200
+      and r.get_json()["callback"]["status"] == "contacted")
+check("A1: status persisted to db",
+      db.get_callback_request(cb_id)["status"] == "contacted")
+
+r = cli_c.post("/agent/api/callbacks/999999/status",
+               json={"status": "done"}, headers={"X-CSRF-Token": tok_c})
+check("A1: unknown callback -> 404", r.status_code == 404)
+
+# 28. Canned replies (A2) -----------------------------------------------------
+en = db.get_canned_replies("en")
+bn = db.get_canned_replies("bn")
+check("A2: 5 EN canned replies seeded", len(en) == 5)
+check("A2: 5 BN canned replies seeded", len(bn) == 5)
+check("A2: canned replies are non-empty strings",
+      all(isinstance(x, str) and x.strip() for x in en + bn))
+
+r = app.app.test_client().get("/agent/api/canned")
+check("A2: canned endpoint requires login (401)", r.status_code == 401)
+
+r = cli_c.get("/agent/api/canned")
+body = r.get_json()
+check("A2: /agent/api/canned returns en+bn lists", r.status_code == 200
+      and isinstance(body.get("en"), list) and isinstance(body.get("bn"), list))
+check("A2: canned endpoint returns the seeded replies",
+      body["en"] == en and body["bn"] == bn)
+
+db.set_setting("canned_replies_en", "{not json")
+check("A2: malformed canned setting -> empty list", db.get_canned_replies("en") == [])
+db.set_canned_replies("en", ["Hello", "Bye"])
+check("A2: set_canned_replies round-trips",
+      db.get_canned_replies("en") == ["Hello", "Bye"])
+db.set_canned_replies("en", en)
+
+# 29. Agent console page renders ----------------------------------------------
+r = cli_c.get("/agent")
+html = r.get_data(as_text=True)
+check("console: /agent renders for a logged-in agent (200)", r.status_code == 200)
+check("console: page includes the CSRF meta tag", 'name="csrf-token"' in html)
+check("console: page includes the composer + callback tab",
+      'id="composer-input"' in html and 'data-tab="callbacks"' in html)
+anon = app.app.test_client().get("/agent")
+check("console: /agent redirects anonymous visitors", anon.status_code == 302
+      and "/agent/login" in anon.headers.get("Location", ""))
+
 # ─── Summary ──────────────────────────────────────────────────────────────────
 passed = sum(1 for _, ok in results if ok)
 print()

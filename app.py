@@ -921,9 +921,18 @@ def agent_logout():
 def agent_home():
     if not session.get("agent_id"):
         return redirect(url_for("agent_login"))
-    return render_template("agent_login.html", error=None, logged_in=True,
-                           display_name=session.get("agent_display_name"),
-                           csrf_token=_csrf_token())
+    admin = db.get_admin_by_id(session.get("agent_id")) or {}
+    return render_template(
+        "agent_console.html",
+        display_name=session.get("agent_display_name"),
+        agent_username=session.get("agent_username"),
+        agent_id=session.get("agent_id"),
+        agent_role=session.get("agent_role"),
+        is_online=bool(admin.get("is_online")),
+        persona_name=db.get_setting("persona_name", "Mita"),
+        persona_name_bn=db.get_setting("persona_name_bn", "Mita"),
+        csrf_token=_csrf_token(),
+    )
 
 
 @app.route("/agent/api/heartbeat", methods=["POST"])
@@ -1021,6 +1030,38 @@ def agent_close(cid):
         return jsonify({"error": "forbidden"}), 403
     ok = db.close_conversation(cid, by="agent")
     return jsonify({"ok": ok})
+
+
+# ─── ROUTES — AGENT (callbacks + canned replies) ──────────────────────────────
+@app.route("/agent/api/callbacks")
+@agent_login_required
+def agent_callbacks():
+    """List callback requests (newest first) for the console's Callbacks tab."""
+    return jsonify({"callbacks": db.list_callback_requests()})
+
+
+@app.route("/agent/api/callbacks/<int:cb_id>/status", methods=["POST"])
+@agent_post_required
+def agent_callback_status(cb_id):
+    """Move a callback request through new -> contacted -> done."""
+    data = request.get_json(silent=True) or {}
+    status = (data.get("status") or "").strip()
+    if status not in db.CALLBACK_STATUSES:
+        return jsonify({"error": "bad_status"}), 400
+    if not db.set_callback_status(cb_id, status):
+        return jsonify({"error": "not_found"}), 404
+    return jsonify({"ok": True, "callback": db.get_callback_request(cb_id)})
+
+
+@app.route("/agent/api/canned")
+@agent_login_required
+def agent_canned():
+    """Return the canned (quick) replies for the composer, per language."""
+    return jsonify({
+        "en": db.get_canned_replies("en"),
+        "bn": db.get_canned_replies("bn"),
+    })
+
 
 if __name__ == "__main__":
     debug = os.environ.get("FLASK_DEBUG", "").lower() in ("1", "true", "yes", "on")

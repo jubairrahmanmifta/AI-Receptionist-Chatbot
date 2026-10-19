@@ -215,6 +215,28 @@ def _create_tables():
         conn.executescript(SCHEMA)
 
 
+# ─── CANNED REPLIES (agent console quick answers) ─────────────────────────────
+# Seeded into the ``settings`` table as JSON strings. They can be edited later
+# from the admin panel without a code change.
+CANNED_REPLIES_EN = [
+    "Hello! Thanks for reaching out to Smile Dental Care. How can I help you today?",
+    "Could you please share your phone number so we can get back to you?",
+    "One moment while I check that for you.",
+    "The doctor will confirm your appointment shortly.",
+    "Thanks for chatting with us — take care!",
+]
+CANNED_REPLIES_BN = [
+    "আসসালামু আলাইকুম! স্মাইল ডেন্টাল কেয়ারে যোগাযোগ করার জন্য ধন্যবাদ। কীভাবে সাহায্য করতে পারি?",
+    "আপনার ফোন নম্বরটা একটু বলবেন? যাতে আমরা যোগাযোগ করতে পারি।",
+    "একটু অপেক্ষা করুন, আমি দেখে নিচ্ছি।",
+    "ডাক্তার আপনার অ্যাপয়েন্টমেন্ট শীঘ্রই নিশ্চিত করবেন।",
+    "আমাদের সাথে কথা বলার জন্য ধন্যবাদ — ভালো থাকুন!",
+]
+
+# Valid callback request statuses (mirrors the ``callback_requests`` comment).
+CALLBACK_STATUSES = ("new", "contacted", "done")
+
+
 # ─── SEED DATA (used only to initialise a brand-new database) ─────────────────
 
 # Prices are stored as a range: ``price`` is the minimum and ``price_max`` the
@@ -242,6 +264,9 @@ SEED_DATA = {
         # How long a silent customer is considered "away" / "gone" while queued.
         "customer_away_seconds": "45",
         "customer_left_seconds": "120",
+        # Agent console quick replies (JSON lists; editable later in /admin).
+        "canned_replies_en": json.dumps(CANNED_REPLIES_EN, ensure_ascii=False),
+        "canned_replies_bn": json.dumps(CANNED_REPLIES_BN, ensure_ascii=False),
     },
     "doctors": [
         {
@@ -363,6 +388,8 @@ def _seed_missing_settings():
         "idle_close_minutes": "30",
         "customer_away_seconds": "45",
         "customer_left_seconds": "120",
+        "canned_replies_en": json.dumps(CANNED_REPLIES_EN, ensure_ascii=False),
+        "canned_replies_bn": json.dumps(CANNED_REPLIES_BN, ensure_ascii=False),
     }
     with _connect() as conn:
         existing = {r["key"] for r in conn.execute("SELECT key FROM settings")}
@@ -667,6 +694,31 @@ def set_setting(key, value):
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+
+def get_canned_replies(lang="en"):
+    """Return the agent console's canned replies for ``lang`` as a list.
+
+    Stored as a JSON array in the ``canned_replies_en`` / ``canned_replies_bn``
+    settings. A missing or malformed value yields an empty list.
+    """
+    key = "canned_replies_bn" if str(lang).lower().startswith("bn") else "canned_replies_en"
+    raw = get_setting(key)
+    try:
+        data = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        data = []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data if str(item).strip()]
+
+
+def set_canned_replies(lang, replies):
+    """Persist a list of canned replies for ``lang`` (used by tests/admin)."""
+    if not isinstance(replies, (list, tuple)):
+        raise ValueError("replies must be a list")
+    key = "canned_replies_bn" if str(lang).lower().startswith("bn") else "canned_replies_en"
+    set_setting(key, json.dumps([str(r) for r in replies], ensure_ascii=False))
 
 
 # ─── PHONE VALIDATION (shared by booking and callbacks) ───────────────────────
@@ -1505,6 +1557,30 @@ def list_callback_requests(status=None):
     query += " ORDER BY id DESC"
     with _connect() as conn:
         return _rows_to_dicts(conn.execute(query, params).fetchall())
+
+
+def get_callback_request(callback_id):
+    """Return a single callback request, or ``None``."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM callback_requests WHERE id = ?", (callback_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_callback_status(callback_id, status):
+    """Update a callback request's status. Returns True when a row changed.
+
+    ``status`` must be one of :data:`CALLBACK_STATUSES`.
+    """
+    if status not in CALLBACK_STATUSES:
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE callback_requests SET status = ? WHERE id = ?",
+            (status, callback_id),
+        )
+        return cur.rowcount > 0
 
 
 def list_callback_requests_for_conversation(conversation_id):

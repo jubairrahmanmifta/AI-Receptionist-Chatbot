@@ -60,6 +60,7 @@ at request time by `prompt_builder.py` — nothing about the clinic is hardcoded
 - Admin     : http://localhost:5000/admin  (owner accounts only)
 - Settings  : http://localhost:5000/admin/config
 - Agent     : http://localhost:5000/agent/login  (agent/owner accounts)
+- Console   : http://localhost:5000/agent  (live agent console, after login)
 
 ## Human handoff (agents)
 
@@ -73,9 +74,11 @@ moves through `bot → waiting → with_agent → closed`:
 - When a customer asks for a human (button or the AI's `HANDOFF_REQUEST`
   marker), the conversation is queued **only if** an agent has a fresh
   heartbeat. Otherwise the customer is offered a callback instead.
-- Agents log in at `/agent/login` (same `admins` table) and use the JSON API
-  under `/agent/api` (heartbeat, queue, conversation, accept/message/handback/
-  close). Every agent POST needs the `X-CSRF-Token` header.
+- Agents log in at `/agent/login` (same `admins` table) and work from the
+  **console at `/agent`**: an Online/Offline switch (with a 15 s heartbeat),
+  Waiting / My chats / Callbacks tabs, the live transcript, canned replies and
+  Hand-back / Close actions. It uses the JSON API under `/agent/api`; every
+  agent POST needs the `X-CSRF-Token` header (read from a `<meta>` tag).
 - Every customer request stamps `conversations.customer_last_seen`, so the queue
   reports `customer_away` (silent for `customer_away_seconds`); a `waiting`
   conversation whose customer disappears is closed with a "customer left"
@@ -93,7 +96,9 @@ otherwise).
 
 Timing settings (editable in `settings`): `handoff_timeout_minutes` (5),
 `agent_online_window_seconds` (45), `idle_close_minutes` (30),
-`customer_away_seconds` (45), `customer_left_seconds` (120).
+`customer_away_seconds` (45), `customer_left_seconds` (120). The console's
+quick answers live in `canned_replies_en` / `canned_replies_bn` (JSON lists of
+five clinic-style replies each, served by `GET /agent/api/canned`).
 
 ## Customer widget
 
@@ -111,15 +116,56 @@ The chat popup:
 See `manual_test_widget.md` for a hands-on script (one browser + `curl` as the
 agent).
 
+## Demo walkthrough
+
+A five-minute tour for a business owner. You need **two browser windows** (or
+one normal + one private window, so the sessions stay separate):
+
+- **Window A — customer:** http://localhost:5000
+- **Window B — agent:** http://localhost:5000/agent/login
+
+Start with demo data:
+
+```bash
+DEMO_SEED=1 python app.py     # seeds agent_riya/agentpass1 and agent_sam/agentpass2
+```
+
+Then:
+
+1. **Bot answers a question.** In Window A, open the chat and ask
+   *"What are your opening hours?"* (or *"কখন খোলা?"*). The persona answers,
+   grounded in the database.
+2. **Bot books an appointment.** Ask *"Book me a cleaning tomorrow at 5pm"*.
+   The bot collects name + phone and confirms. Show the row in `/admin`.
+3. **Customer asks for a person.** Click **Talk to a person** (or type *"I want
+   to talk to a human"*). The widget shows the "waiting for an agent" banner.
+4. **Agent accepts and replies.** In Window B, log in as `agent_riya` /
+   `agentpass1`, flip the switch to **Online**, and the chat appears in
+   **Waiting** with its wait time and language. Click it, **Accept**, and send a
+   reply — or pick a **canned reply** from the dropdown. Window A updates within
+   a couple of seconds.
+5. **Agent hands back.** Click **Hand back to bot**; the customer is talking to
+   the persona again (the transcript shows a system note).
+6. **Nobody online → callback.** In Window B flip the agent **Offline**. In
+   Window A ask for a person again: instead of queueing, the widget offers a
+   **callback form**. Submit name + phone; then in Window B open the
+   **Callbacks** tab and move it `New → Contacted → Done`.
+
+Optional extras to show: the **unread dot** on *My chats*, the sound toggle
+(off by default — it beeps on a new waiting chat), the `(N)` counter in the
+browser-tab title, and the responsive layout (narrow the window: the list and
+the chat become separate views with a back button).
+
 ## Tests
 ```bash
 python test_booking.py    # 30 checks — booking pipeline
-python test_handoff.py    # 69 checks — sessions, state machine, agent API, widget API
+python test_handoff.py    # 90 checks — sessions, state machine, agent API, widget API
 ```
 Both run against a throwaway database with a mocked AI (normal booking, taken
 slot, invalid phone, non-working day, past date, malformed marker, atomic
 double-booking, reset, rate limit; plus handoff state transitions, agent races,
-permissions/CSRF, timeouts and session isolation).
+permissions/CSRF, timeouts, session isolation, callbacks, canned replies and the
+console page).
 
 ## File structure
 ```
@@ -140,7 +186,8 @@ dental_v4/
     ├── admin_login.html    ← Admin (owner) login
     ├── admin.html          ← Appointments table
     ├── admin_config.html   ← Settings page
-    └── agent_login.html    ← Agent login / console placeholder
+    ├── agent_login.html    ← Agent login
+    └── agent_console.html  ← Agent console (queue, transcript, callbacks)
 ```
 
 ## API reference
@@ -166,4 +213,7 @@ Agent (login + CSRF header required):
 | POST | `/agent/api/conversation/<id>/message` | Send a message |
 | POST | `/agent/api/conversation/<id>/handback` | Return to the bot |
 | POST | `/agent/api/conversation/<id>/close` | Close the conversation |
+| GET  | `/agent/api/callbacks` | Callback requests, newest first |
+| POST | `/agent/api/callbacks/<id>/status` | `{status: new\|contacted\|done}` |
+| GET  | `/agent/api/canned` | Canned replies `{en: [...], bn: [...]}` |
 
