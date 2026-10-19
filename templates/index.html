@@ -426,7 +426,7 @@
 
 <script>
 let LANG = "bn";
-let SID  = "s_" + Math.random().toString(36).slice(2);
+let SID  = null;  // issued by POST /session when the chat starts
 let busy = false;
 
 const T = {
@@ -434,13 +434,13 @@ const T = {
     name: "মিতা", role: "AI রিসেপশনিস্ট",
     placeholder: "বাংলায় লিখুন...",
     welcome: "আস্সালামু আলাইকুম! স্মাইল ডেন্টাল কেয়ারে স্বাগতম। আমি মিতা। কীভাবে সাহায্য করতে পারি? 😊",
-    saved: "✅ আপনার অ্যাপয়েন্টমেন্ট নিশ্চিত হয়েছে!",
+    saved: "✅ আপনার অনুরোধ পেয়েছি! ক্লিনিক শীঘ্রই ফোন করে নিশ্চিত করবে।",
   },
   en: {
     name: "Mita", role: "AI Receptionist",
     placeholder: "Type your message...",
     welcome: "Hello! Welcome to Smile Dental Care. I'm Mita, your AI receptionist. How can I help you today? 😊",
-    saved: "✅ Your appointment has been confirmed!",
+    saved: "✅ Request received! The clinic will confirm shortly.",
   }
 };
 
@@ -458,6 +458,19 @@ document.getElementById("overlay").addEventListener("click", e => {
   if (e.target === document.getElementById("overlay")) closeChat();
 });
 
+async function newSession(lang) {
+  // The server issues unguessable session ids; the widget never invents one.
+  try {
+    const res  = await fetch("/session", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({lang: lang || "bn"})
+    });
+    const data = await res.json();
+    if (data && data.session_id) return data.session_id;
+  } catch (e) { /* fall through to the error path below */ }
+  return null;
+}
+
 async function startChat(lang) {
   LANG = lang;
   const t = T[lang];
@@ -468,10 +481,7 @@ async function startChat(lang) {
   document.getElementById("msg-input").placeholder   = t.placeholder;
   document.getElementById("messages").innerHTML      = "";
 
-  await fetch("/reset", {
-    method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({session_id: SID})
-  });
+  SID = await newSession(lang);
 
   addMsg("agent", t.welcome);
 }
@@ -524,6 +534,8 @@ async function sendMsg() {
   input.value = "";
   input.style.height = "auto";
   addMsg("user", text);
+
+  if (!SID) SID = await newSession(LANG);
 
   busy = true;
   document.getElementById("send-btn").disabled = true;

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  {% if logged_in %}<meta name="csrf-token" content="{{ csrf_token }}"/>{% endif %}
+  <title>Agent Login — Smile Dental Care</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+           background: #f0f4ff; min-height: 100vh; display: flex;
+           align-items: center; justify-content: center; padding: 24px; color: #1a1f36; }
+    .card { background: #fff; border-radius: 16px; padding: 40px 34px; width: 100%;
+            max-width: 360px; box-shadow: 0 8px 40px rgba(0,0,0,.1); }
+    h1 { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
+    p.sub { font-size: 13px; color: #6b7280; margin-bottom: 24px; }
+    label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+    input { width: 100%; padding: 11px 13px; border: 1.5px solid #e5e7eb;
+            border-radius: 9px; font-size: 14px; outline: none; margin-bottom: 16px; }
+    input:focus { border-color: #6366f1; }
+    button { width: 100%; padding: 12px; border: none; border-radius: 9px;
+             background: #6366f1; color: #fff; font-size: 14px; font-weight: 600;
+             cursor: pointer; }
+    .error { background: #fef2f2; color: #b91c1c; border-radius: 8px;
+             padding: 10px 12px; font-size: 13px; margin-bottom: 16px; }
+    .note { font-size: 12px; color: #6b7280; margin-top: 16px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    {% if logged_in %}
+      <h1>Agent console</h1>
+      <p class="sub">Signed in as {{ display_name }}.</p>
+      <p class="note">
+        The live agent dashboard is coming in the next step. Until then, use the
+        JSON API under <code>/agent/api</code>.
+      </p>
+      <p class="note"><a href="{{ url_for('agent_logout') }}">Log out</a></p>
+    {% else %}
+      <h1>Agent login</h1>
+      <p class="sub">Smile Dental Care — reception console</p>
+      {% if error %}<div class="error">{{ error }}</div>{% endif %}
+      <form method="post" action="{{ url_for('agent_login') }}">
+        <label for="username">Username</label>
+        <input id="username" name="username" autocomplete="username" required/>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password"
+               autocomplete="current-password" required/>
+        <button type="submit">Sign in</button>
+      </form>
+    {% endif %}
+  </div>
+</body>
+</html>

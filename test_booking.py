@@ -54,9 +54,22 @@ def marker(payload):
     return "Sure, let me book that for you!\nSAVE_APPOINTMENT:" + json.dumps(payload)
 
 
+# /chat now requires a server-issued session id (POST /session creates one and
+# registers a conversation). Cache one per logical test session.
+_session_cache = {}
+
+
+def session_for(name):
+    if name not in _session_cache:
+        resp = client.post("/session", json={"lang": "en"})
+        _session_cache[name] = resp.get_json()["session_id"]
+    return _session_cache[name]
+
+
 def post_chat(message, session_id="T1", lang="en", headers=None):
-    return client.post("/chat", json={"session_id": session_id, "message": message,
-                                      "lang": lang}, headers=headers or {})
+    return client.post("/chat", json={"session_id": session_for(session_id),
+                                      "message": message, "lang": lang},
+                       headers=headers or {})
 
 
 def find_slot(doctor_id, *, weekdays=None, days=60):
@@ -91,7 +104,7 @@ check("normal booking returns id", isinstance(body["appointment_id"], int))
 check("marker stripped from reply", "SAVE_APPOINTMENT" not in body["reply"])
 saved = db.get_appointment(body["appointment_id"])
 check("row has status pending", saved["status"] == "pending")
-check("row stores session_id", saved["session_id"] == "normal")
+check("row stores session_id", saved["session_id"] == session_for("normal"))
 check("row stores language", saved["language"] == "en")
 check("service mapped to id", saved["service_id"] is not None)
 check("normal booking no corrective call", state["calls"] == ["normal"])

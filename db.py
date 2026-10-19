@@ -12,6 +12,7 @@ string formatting.
 """
 
 import os
+import re
 import json
 import sqlite3
 import datetime
@@ -150,21 +151,59 @@ CREATE TABLE IF NOT EXISTS appointments (
     updated_at   TEXT
 );
 
+CREATE TABLE IF NOT EXISTS admins (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT UNIQUE,
+    password_hash TEXT,
+    display_name  TEXT,
+    role          TEXT DEFAULT 'owner',   -- 'owner' or 'agent'
+    is_online     INTEGER DEFAULT 0,
+    last_seen     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id         INTEGER DEFAULT 1,
+    session_id          TEXT,
+    status              TEXT DEFAULT 'bot',  -- bot / waiting / with_agent / closed
+    agent_id            INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+    handoff_reason      TEXT,
+    lang                TEXT,
+    created_at          TEXT,
+    handoff_requested_at TEXT,
+    accepted_at         TEXT,
+    closed_at           TEXT,
+    last_message_at     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_session
+    ON conversations(session_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_status
+    ON conversations(status);
+
 CREATE TABLE IF NOT EXISTS chat_messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT,
-    role       TEXT,
-    content    TEXT,
-    created_at TEXT
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT,
+    role            TEXT,                 -- legacy: user / assistant / system
+    content         TEXT,
+    created_at      TEXT,
+    conversation_id INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
+    sender_type     TEXT,                 -- customer / bot / agent / system
+    agent_id        INTEGER REFERENCES admins(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session
     ON chat_messages(session_id);
 
-CREATE TABLE IF NOT EXISTS admins (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT UNIQUE,
-    password_hash TEXT
+CREATE TABLE IF NOT EXISTS callback_requests (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id     INTEGER DEFAULT 1,
+    conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+    name            TEXT,
+    phone           TEXT,
+    message         TEXT,
+    status          TEXT DEFAULT 'new',   -- new / contacted / done
+    created_at      TEXT
 );
 """
 
@@ -195,6 +234,10 @@ SEED_DATA = {
         "extra_info_en": "",
         "extra_info_bn": "",
         "ai_model": "openrouter/auto",
+        # Human-handoff timings.
+        "handoff_timeout_minutes": "5",
+        "agent_online_window_seconds": "45",
+        "idle_close_minutes": "30",
     },
     "doctors": [
         {
@@ -252,17 +295,141 @@ OLD_PRICE_RANGES = {
 
 # ─── SCHEMA MIGRATIONS (idempotent, check columns before altering) ────────────
 
+def _table_columns(conn, table):
+    """Return the set of column names for a table (SQLite, parameter-free)."""
+    return {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+
+
 def _migrate_columns():
     """Add columns introduced after the first release (safe to re-run)."""
     with _connect() as conn:
-        service_cols = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+        service_cols = _table_columns(conn, "services")
         if "price_max" not in service_cols:
             conn.execute("ALTER TABLE services ADD COLUMN price_max REAL")
             print("[db] Added column services.price_max")
-        appt_cols = {r["name"] for r in conn.execute("PRAGMA table_info(appointments)")}
+        appt_cols = _table_columns(conn, "appointments")
         if "session_id" not in appt_cols:
             conn.execute("ALTER TABLE appointments ADD COLUMN session_id TEXT")
             print("[db] Added column appointments.session_id")
+
+        # Human-handoff columns.
+        admin_cols = _table_columns(conn, "admins")
+        for col, ddl in (
+            ("display_name", "ALTER TABLE admins ADD COLUMN display_name TEXT"),
+            ("role", "ALTER TABLE admins ADD COLUMN role TEXT DEFAULT 'owner'"),
+            ("is_online", "ALTER TABLE admins ADD COLUMN is_online INTEGER DEFAULT 0"),
+            ("last_seen", "ALTER TABLE admins ADD COLUMN last_seen TEXT"),
+        ):
+            if col not in admin_cols:
+                conn.execute(ddl)
+                print("[db] Added column admins.%s" % col)
+
+        msg_cols = _table_columns(conn, "chat_messages")
+        for col, ddl in (
+            ("conversation_id",
+             "ALTER TABLE chat_messages ADD COLUMN conversation_id INTEGER"),
+            ("sender_type", "ALTER TABLE chat_messages ADD COLUMN sender_type TEXT"),
+            ("agent_id", "ALTER TABLE chat_messages ADD COLUMN agent_id INTEGER"),
+        ):
+            if col not in msg_cols:
+                conn.execute(ddl)
+                print("[db] Added column chat_messages.%s" % col)
+
+        # Indexes that depend on columns added above (must run after the ALTERs).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation "
+            "ON chat_messages(conversation_id)"
+        )
+
+
+def _seed_missing_settings():
+    """Insert handoff settings that are absent, leaving existing values alone."""
+    defaults = {
+        "handoff_timeout_minutes": "5",
+        "agent_online_window_seconds": "45",
+        "idle_close_minutes": "30",
+    }
+    with _connect() as conn:
+        existing = {r["key"] for r in conn.execute("SELECT key FROM settings")}
+        for key, value in defaults.items():
+            if key not in existing:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)", (key, value)
+                )
+
+
+SENDER_BY_ROLE = {"user": "customer", "assistant": "bot", "system": "system"}
+
+
+def _migrate_conversations():
+    """Backfill conversations + ``sender_type`` for pre-handoff chat logs.
+
+    One conversation is created per contiguous run of messages for a session,
+    splitting at legacy reset markers so the old "reset starts a fresh
+    conversation" behaviour is preserved.
+    """
+    with _connect() as conn:
+        # Anything with a message but no sender_type needs backfilling.
+        pending = conn.execute(
+            """SELECT COUNT(*) AS n FROM chat_messages
+               WHERE sender_type IS NULL OR conversation_id IS NULL"""
+        ).fetchone()["n"]
+        if pending == 0:
+            return
+
+        sessions = [r["session_id"] for r in conn.execute(
+            "SELECT DISTINCT session_id FROM chat_messages WHERE session_id IS NOT NULL"
+        )]
+        created = 0
+        for session_id in sessions:
+            rows = conn.execute(
+                """SELECT * FROM chat_messages
+                   WHERE session_id = ? ORDER BY id""",
+                (session_id,),
+            ).fetchall()
+            conv_id = None
+            for row in rows:
+                is_reset = (row["role"] == "system"
+                            and row["content"] == RESET_MARKER)
+                if is_reset and conv_id is not None:
+                    # Close the current conversation and start a fresh one.
+                    conn.execute(
+                        "UPDATE conversations SET status = 'closed', closed_at = ? "
+                        "WHERE id = ?", (row["created_at"] or _now(), conv_id),
+                    )
+                    conv_id = None
+                if conv_id is None:
+                    cur = conn.execute(
+                        """INSERT INTO conversations
+                           (business_id, session_id, status, lang, created_at,
+                            last_message_at)
+                           VALUES (1, ?, 'bot', NULL, ?, ?)""",
+                        (session_id, row["created_at"] or _now(),
+                         row["created_at"] or _now()),
+                    )
+                    conv_id = cur.lastrowid
+                    created += 1
+                sender = row["sender_type"] or SENDER_BY_ROLE.get(row["role"], "system")
+                conn.execute(
+                    "UPDATE chat_messages SET conversation_id = ?, sender_type = ? "
+                    "WHERE id = ?", (conv_id, sender, row["id"]),
+                )
+        if created:
+            print("[db] Linked chat history into %d conversation(s)." % created)
+
+
+def _seed_demo_agents():
+    """Create two demo agent accounts when ``DEMO_SEED=1`` (idempotent)."""
+    if os.environ.get("DEMO_SEED") != "1":
+        return
+    demos = [
+        ("agent_riya", "Riya (demo)", "agentpass1"),
+        ("agent_sam", "Sam (demo)", "agentpass2"),
+    ]
+    for username, display_name, password in demos:
+        if not get_admin(username):
+            create_admin(username, password, display_name=display_name, role="agent")
+            print("[db] Seeded demo agent '%s'." % username)
 
 
 def preview_price_backfill():
@@ -432,19 +599,22 @@ def _migrate_appointments_json():
 # ─── INIT ─────────────────────────────────────────────────────────────────────
 
 def init_db(ai_model="openrouter/auto", admin_username=None, admin_password=None):
-    """Create tables, migrate columns, seed data, seed admin, migrate JSON.
+    """Create tables, migrate columns/data, seed data and seed admin.
 
     Safe to call on every app startup: table creation uses ``IF NOT EXISTS``,
-    column migrations check for the column first, seeding only happens when the
-    settings table is empty, and the legacy JSON migration only runs while
-    ``appointments.json`` still exists.
+    column migrations check for the column first, data migrations are guarded by
+    completeness checks, seeding only happens when the settings table is empty,
+    and the legacy JSON migration only runs while ``appointments.json`` exists.
     """
     _create_tables()
-    _seed_if_empty(ai_model)
     _migrate_columns()
+    _seed_if_empty(ai_model)
+    _seed_missing_settings()
     _backfill_price_max()
+    _migrate_conversations()
     if admin_username and admin_password:
         ensure_admin(admin_username, admin_password)
+    _seed_demo_agents()
     _migrate_appointments_json()
 
 
@@ -457,6 +627,23 @@ def get_settings():
     return {r["key"]: r["value"] for r in rows}
 
 
+def get_setting(key, default=None):
+    """Return a single setting value, or ``default`` when it is missing."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def get_setting_int(key, default=0):
+    """Return a setting coerced to ``int``, falling back to ``default``."""
+    try:
+        return int(float(get_setting(key, default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def set_setting(key, value):
     """Insert or update a single setting by key."""
     with _connect() as conn:
@@ -465,6 +652,21 @@ def set_setting(key, value):
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+
+# ─── PHONE VALIDATION (shared by booking and callbacks) ───────────────────────
+# Accepts +8801XXXXXXXXX, 8801XXXXXXXXX and 01XXXXXXXXX (3rd digit 3–9).
+PHONE_RE = re.compile(r"^(?:\+?880|0)1[3-9]\d{8}$")
+
+
+def normalize_phone(raw):
+    """Strip spaces/brackets/dashes from a phone number for validation."""
+    return re.sub(r"[\s\-()]", "", str(raw or "")).strip()
+
+
+def is_valid_phone(raw):
+    """Return True when ``raw`` looks like a valid Bangladeshi mobile number."""
+    return bool(PHONE_RE.match(normalize_phone(raw)))
 
 
 def format_price(price, price_max=None):
@@ -806,62 +1008,600 @@ def delete_appointment(appointment_id):
         return cur.rowcount > 0
 
 
-# ─── CHAT MESSAGES ────────────────────────────────────────────────────────────
+# ─── CONVERSATIONS ────────────────────────────────────────────────────────────
+#
+# A conversation is the unit of human handoff. Its ``status`` is one of:
+#   bot        — the AI is answering
+#   waiting    — the customer asked for a human and is queued
+#   with_agent — a human agent has accepted and is chatting
+#   closed     — finished; the next customer message starts a new conversation
+#
+# All transitions run inside ``BEGIN IMMEDIATE`` transactions so concurrent
+# agents/customers cannot corrupt the state.
 
 RESET_MARKER = "__RESET__"
 
+# Map legacy ``role`` values to the new ``sender_type`` values (and back).
+ROLE_BY_SENDER = {"customer": "user", "bot": "assistant",
+                  "agent": "assistant", "system": "system"}
 
-def add_chat_message(session_id, role, content):
-    """Append a chat message to the log. Returns the new id."""
+HANDOFF_TIMEOUT_MESSAGE = (
+    "Sorry, no agent is free right now. You can leave your name and number for "
+    "a callback and we'll call you back.",
+    "দুঃখিত, এখন কোনো এজেন্ট ফ্রি নেই। আপনার নাম আর নম্বর দিলে আমরা ফোন করে জানাব।",
+)
+IDLE_CLOSE_MESSAGE = (
+    "This chat was closed due to inactivity.",
+    "অনেকক্ষণ কোনো বার্তা না আসায় কথোপকথনটি বন্ধ করা হলো।",
+)
+AGENT_BACK_MESSAGE = (
+    "The assistant is back and can help you again.",
+    "সহকারী আবার ফিরে এসেছে এবং আপনাকে সাহায্য করতে পারবে।",
+)
+CONVERSATION_CLOSED_MESSAGE = (
+    "This conversation has been closed.",
+    "এই কথোপকথনটি বন্ধ করা হয়েছে।",
+)
+
+
+def _msg(conversation, en, bn):
+    """Pick the Bengali or English variant based on the conversation language."""
+    lang = conversation["lang"] if conversation is not None else None
+    return bn if lang == "bn" else en
+
+
+def _agent_display_name(conn, agent_id):
+    """Return an agent's display name (falling back to username)."""
+    if agent_id is None:
+        return "Agent"
+    row = conn.execute(
+        "SELECT username, display_name FROM admins WHERE id = ?", (agent_id,)
+    ).fetchone()
+    if not row:
+        return "Agent"
+    return row["display_name"] or row["username"]
+
+
+def _insert_message(conn, conversation_id, session_id, sender_type, content,
+                    agent_id=None, created_at=None):
+    """Insert a chat message and bump the conversation's last_message_at."""
+    created = created_at or _now()
+    role = ROLE_BY_SENDER.get(sender_type, sender_type)
+    cur = conn.execute(
+        """INSERT INTO chat_messages
+           (session_id, role, content, created_at, conversation_id, sender_type, agent_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (session_id, role, content, created, conversation_id, sender_type, agent_id),
+    )
+    conn.execute(
+        "UPDATE conversations SET last_message_at = ? WHERE id = ?",
+        (created, conversation_id),
+    )
+    return cur.lastrowid
+
+
+def get_conversation(conversation_id):
+    """Return one conversation as a dict, or ``None``."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_current_conversation(session_id):
+    """Return the newest non-closed conversation for a session, or ``None``."""
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM conversations
+               WHERE session_id = ? AND status != 'closed'
+               ORDER BY id DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def session_exists(session_id):
+    """Return True when a session has ever had a conversation (i.e. was issued)."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM conversations WHERE session_id = ? LIMIT 1", (session_id,)
+        ).fetchone() is not None
+
+
+def get_or_create_conversation(session_id, lang=None):
+    """Return the open conversation for ``session_id``, creating one if needed.
+
+    A closed conversation is never returned; the next message starts a fresh
+    one, which is how reset/close is implemented.
+    """
+    now = _now()
+    with _connect_tx() as conn:
+        row = conn.execute(
+            """SELECT * FROM conversations
+               WHERE session_id = ? AND status != 'closed'
+               ORDER BY id DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+        if row:
+            if lang and not row["lang"]:
+                conn.execute(
+                    "UPDATE conversations SET lang = ? WHERE id = ?", (lang, row["id"])
+                )
+                row = conn.execute(
+                    "SELECT * FROM conversations WHERE id = ?", (row["id"],)
+                ).fetchone()
+            return dict(row)
+        cur = conn.execute(
+            """INSERT INTO conversations
+               (business_id, session_id, status, lang, created_at, last_message_at)
+               VALUES (1, ?, 'bot', ?, ?, ?)""",
+            (session_id, lang, now, now),
+        )
+        created_id = cur.lastrowid
+        return dict(conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (created_id,)
+        ).fetchone())
+
+
+def add_message(conversation_id, sender_type, content, agent_id=None):
+    """Append a message of any sender type to a conversation. Returns its id."""
+    if not content:
+        return None
+    with _connect() as conn:
+        conv = conn.execute(
+            "SELECT session_id FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if not conv:
+            return None
+        return _insert_message(
+            conn, conversation_id, conv["session_id"], sender_type, content, agent_id
+        )
+
+
+def customer_send_message(conversation_id, content):
+    """Store a customer message while the conversation is ``with_agent``."""
+    if not content:
+        return None
+    with _connect_tx() as conn:
+        conv = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if not conv or conv["status"] != "with_agent":
+            return None
+        return _insert_message(
+            conn, conversation_id, conv["session_id"], "customer", content
+        )
+
+
+def agent_send_message(conversation_id, agent_id, content):
+    """Store an agent message when the conversation is assigned to them."""
+    if not content:
+        return None
+    with _connect_tx() as conn:
+        conv = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if not conv or conv["status"] != "with_agent" or conv["agent_id"] != agent_id:
+            return None
+        return _insert_message(
+            conn, conversation_id, conv["session_id"], "agent", content, agent_id
+        )
+
+
+def _connection_setting(conn, key, default):
+    """Read a setting value using an existing connection."""
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def _online_agents(conn):
+    """Count agents/owners whose heartbeat is fresh enough to be 'online'."""
+    try:
+        window = int(float(_connection_setting(conn, "agent_online_window_seconds", 45)))
+    except (TypeError, ValueError):
+        window = 45
+    cutoff = (dhaka_now() - datetime.timedelta(seconds=window)).isoformat()
+    return conn.execute(
+        """SELECT COUNT(*) AS n FROM admins
+           WHERE is_online = 1 AND role IN ('agent', 'owner')
+             AND last_seen IS NOT NULL AND last_seen >= ?""",
+        (cutoff,),
+    ).fetchone()["n"]
+
+
+def _queue_position(conn, conversation):
+    """Return this conversation's 1-based position in the waiting queue."""
+    return conn.execute(
+        """SELECT COUNT(*) AS n FROM conversations
+           WHERE status = 'waiting'
+             AND handoff_requested_at <= ?""",
+        (conversation["handoff_requested_at"],),
+    ).fetchone()["n"]
+
+
+def request_handoff(conversation_id, reason=None):
+    """Queue a conversation for a human agent.
+
+    Returns ``{"queued": bool, "position": int|None, "status": str}``. If at
+    least one agent is online the conversation becomes ``waiting`` (never
+    creating a duplicate queue entry); otherwise the status stays ``bot``.
+    """
+    now = _now()
+    with _connect_tx() as conn:
+        conv = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if not conv:
+            return {"queued": False, "position": None, "status": None}
+        if conv["status"] == "closed":
+            return {"queued": False, "position": None, "status": "closed"}
+        if conv["status"] == "with_agent":
+            return {"queued": True, "position": 0, "status": "with_agent",
+                    "already": True}
+        if conv["status"] == "waiting":
+            return {"queued": True, "position": _queue_position(conn, conv),
+                    "status": "waiting", "already": True}
+
+        if _online_agents(conn):
+            conn.execute(
+                """UPDATE conversations
+                   SET status = 'waiting', handoff_reason = ?,
+                       handoff_requested_at = ?, last_message_at = ?
+                   WHERE id = ?""",
+                (reason, now, now, conversation_id),
+            )
+            conv = conn.execute(
+                "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+            ).fetchone()
+            return {"queued": True, "position": _queue_position(conn, conv),
+                    "status": "waiting"}
+        # Nobody online: remember the reason but stay with the bot.
+        conn.execute(
+            "UPDATE conversations SET handoff_reason = ? WHERE id = ?",
+            (reason, conversation_id),
+        )
+        return {"queued": False, "position": None, "status": "bot"}
+
+
+def accept_conversation(conversation_id, agent_id):
+    """Claim a waiting conversation for an agent. Returns True only once.
+
+    The conditional ``UPDATE`` guarantees two racing agents cannot both win.
+    On success a "<name> joined the chat" system message is stored.
+    """
+    now = _now()
+    with _connect_tx() as conn:
+        cur = conn.execute(
+            """UPDATE conversations
+               SET status = 'with_agent', agent_id = ?, accepted_at = ?
+               WHERE id = ? AND status = 'waiting' AND agent_id IS NULL""",
+            (agent_id, now, conversation_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        conv = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        name = _agent_display_name(conn, agent_id)
+        _insert_message(
+            conn, conversation_id, conv["session_id"], "system",
+            "%s joined the chat." % name, created_at=now,
+        )
+        return True
+
+
+def hand_back_to_bot(conversation_id, agent_id):
+    """Return a ``with_agent`` conversation to the bot. Returns True on success."""
+    now = _now()
+    with _connect_tx() as conn:
+        conv = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if not conv or conv["status"] != "with_agent":
+            return False
+        cur = conn.execute(
+            """UPDATE conversations
+               SET status = 'bot', agent_id = NULL, last_message_at = ?
+               WHERE id = ? AND status = 'with_agent'""",
+            (now, conversation_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _insert_message(
+            conn, conversation_id, conv["session_id"], "system",
+            _msg(conv, *AGENT_BACK_MESSAGE), created_at=now,
+        )
+        return True
+
+
+def close_conversation(conversation_id, by="system"):
+    """Close a conversation and record a system message. Returns True on success."""
+    now = _now()
+    with _connect_tx() as conn:
+        conv = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if not conv or conv["status"] == "closed":
+            return False
+        cur = conn.execute(
+            """UPDATE conversations
+               SET status = 'closed', closed_at = ?, last_message_at = ?
+               WHERE id = ? AND status != 'closed'""",
+            (now, now, conversation_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _insert_message(
+            conn, conversation_id, conv["session_id"], "system",
+            _msg(conv, *CONVERSATION_CLOSED_MESSAGE), created_at=now,
+        )
+        return True
+
+
+def run_housekeeping():
+    """Apply time-based transitions lazily (no background threads).
+
+    - ``waiting`` longer than ``handoff_timeout_minutes`` -> back to ``bot``
+      with a system message offering a callback.
+    - ``with_agent`` idle longer than ``idle_close_minutes`` -> ``closed``.
+
+    Safe to call repeatedly; returns a small summary dict.
+    """
+    now = dhaka_now()
+    now_iso = now.isoformat()
+    timed_out = closed = 0
+    with _connect_tx() as conn:
+        try:
+            timeout = int(float(_connection_setting(conn, "handoff_timeout_minutes", 5)))
+        except (TypeError, ValueError):
+            timeout = 5
+        cutoff = (now - datetime.timedelta(minutes=timeout)).isoformat()
+        waiting = conn.execute(
+            """SELECT * FROM conversations
+               WHERE status = 'waiting'
+                 AND handoff_requested_at IS NOT NULL
+                 AND handoff_requested_at <= ?""",
+            (cutoff,),
+        ).fetchall()
+        for conv in waiting:
+            conn.execute(
+                "UPDATE conversations SET status = 'bot', agent_id = NULL, "
+                "last_message_at = ? WHERE id = ?", (now_iso, conv["id"]),
+            )
+            _insert_message(
+                conn, conv["id"], conv["session_id"], "system",
+                _msg(conv, *HANDOFF_TIMEOUT_MESSAGE), created_at=now_iso,
+            )
+            timed_out += 1
+
+        try:
+            idle = int(float(_connection_setting(conn, "idle_close_minutes", 30)))
+        except (TypeError, ValueError):
+            idle = 30
+        cutoff2 = (now - datetime.timedelta(minutes=idle)).isoformat()
+        idle_rows = conn.execute(
+            """SELECT * FROM conversations
+               WHERE status = 'with_agent'
+                 AND COALESCE(last_message_at, accepted_at) <= ?""",
+            (cutoff2,),
+        ).fetchall()
+        for conv in idle_rows:
+            conn.execute(
+                "UPDATE conversations SET status = 'closed', closed_at = ?, "
+                "last_message_at = ? WHERE id = ?", (now_iso, now_iso, conv["id"]),
+            )
+            _insert_message(
+                conn, conv["id"], conv["session_id"], "system",
+                _msg(conv, *IDLE_CLOSE_MESSAGE), created_at=now_iso,
+            )
+            closed += 1
+    return {"timed_out": timed_out, "idle_closed": closed}
+
+
+def create_callback_request(conversation_id, name, phone, message):
+    """Create a callback request (validates the phone). Returns the new id.
+
+    Raises ``ValueError`` when the phone number is not a valid BD mobile.
+    """
+    if not is_valid_phone(phone):
+        raise ValueError("invalid phone")
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO chat_messages (session_id, role, content, created_at)
-               VALUES (?, ?, ?, ?)""",
-            (session_id, role, content, _now()),
+            """INSERT INTO callback_requests
+               (business_id, conversation_id, name, phone, message, status, created_at)
+               VALUES (1, ?, ?, ?, ?, 'new', ?)""",
+            (conversation_id, name, normalize_phone(phone), message, _now()),
         )
     return cur.lastrowid
 
 
-def reset_conversation(session_id):
-    """Start a fresh conversation without deleting the message log.
+def list_callback_requests(status=None):
+    """Return callback requests (newest first), optionally filtered."""
+    query = "SELECT * FROM callback_requests"
+    params = []
+    if status:
+        query += " WHERE status = ?"
+        params.append(status)
+    query += " ORDER BY id DESC"
+    with _connect() as conn:
+        return _rows_to_dicts(conn.execute(query, params).fetchall())
 
-    Inserts a reset marker; ``get_recent_messages`` ignores everything before
-    the most recent marker.
-    """
-    return add_chat_message(session_id, "system", RESET_MARKER)
+
+def _wait_seconds(since_iso, now):
+    """Return whole seconds between an ISO timestamp and ``now`` (>= 0)."""
+    if not since_iso:
+        return 0
+    try:
+        since = datetime.datetime.fromisoformat(since_iso)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, int((now - since).total_seconds()))
 
 
-def get_recent_messages(session_id, limit=12):
-    """Return the last ``limit`` user/assistant messages, oldest first.
+def _conversation_summaries(rows, now):
+    """Attach last-message preview and wait time to conversation rows."""
+    out = _rows_to_dicts(rows)
+    for conv in out:
+        conv["wait_seconds"] = _wait_seconds(conv.get("handoff_requested_at"), now)
+    return out
 
-    Messages before the most recent reset marker are ignored, so a reset
-    starts a fresh conversation without destroying history.
+
+_SUMMARY_SELECT = """
+    SELECT c.*,
+           (SELECT content FROM chat_messages m
+             WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) AS last_message,
+           (SELECT sender_type FROM chat_messages m
+             WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) AS last_sender
+      FROM conversations c
+"""
+
+
+def list_waiting():
+    """Return waiting conversations (FIFO) with preview and wait time."""
+    now = dhaka_now()
+    with _connect() as conn:
+        rows = conn.execute(
+            _SUMMARY_SELECT + " WHERE c.status = 'waiting' "
+            "ORDER BY c.handoff_requested_at ASC"
+        ).fetchall()
+    return _conversation_summaries(rows, now)
+
+
+def list_my_conversations(agent_id):
+    """Return the conversations currently assigned to an agent."""
+    now = dhaka_now()
+    with _connect() as conn:
+        rows = conn.execute(
+            _SUMMARY_SELECT + " WHERE c.status = 'with_agent' AND c.agent_id = ? "
+            "ORDER BY c.last_message_at DESC",
+            (agent_id,),
+        ).fetchall()
+    return _conversation_summaries(rows, now)
+
+
+def queue_position(conversation_id):
+    """Return the 1-based waiting-queue position, or ``None`` if not waiting."""
+    conv = get_conversation(conversation_id)
+    if not conv or conv["status"] != "waiting":
+        return None
+    with _connect() as conn:
+        return _queue_position(conn, conv)
+
+
+def get_conversation_with_messages(conversation_id, after_id=None):
+    """Return a conversation plus its transcript (optionally after ``after_id``).
+
+    Each message carries ``sender_type`` and, for agent messages, the agent's
+    display name. Returns ``None`` when the conversation does not exist.
     """
     with _connect() as conn:
-        marker = conn.execute(
-            """SELECT MAX(id) AS m FROM chat_messages
-               WHERE session_id = ? AND role = 'system' AND content = ?""",
-            (session_id, RESET_MARKER),
-        ).fetchone()["m"] or 0
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if not row:
+            return None
+        conversation = dict(row)
+        conversation["agent_display_name"] = (
+            _agent_display_name(conn, conversation["agent_id"])
+            if conversation["agent_id"] else None
+        )
+        query = (
+            """SELECT m.*, a.username AS agent_username,
+                      a.display_name AS agent_display_name
+                 FROM chat_messages m
+                 LEFT JOIN admins a ON a.id = m.agent_id
+                WHERE m.conversation_id = ?"""
+        )
+        params = [conversation_id]
+        if after_id:
+            query += " AND m.id > ?"
+            params.append(after_id)
+        query += " ORDER BY m.id ASC"
+        messages = _rows_to_dicts(conn.execute(query, params).fetchall())
+    return {"conversation": conversation, "messages": messages}
+
+
+def get_conversation_history(conversation_id, limit=12):
+    """Return recent messages for the AI as ``{"role", "content"}`` dicts.
+
+    Customer -> user, bot/agent -> assistant; system messages are skipped.
+    """
+    with _connect() as conn:
         rows = conn.execute(
             """SELECT * FROM (
                    SELECT * FROM chat_messages
-                   WHERE session_id = ? AND id > ?
-                     AND role IN ('user', 'assistant')
-                   ORDER BY id DESC
-                   LIMIT ?
+                   WHERE conversation_id = ?
+                     AND sender_type IN ('customer', 'bot', 'agent')
+                   ORDER BY id DESC LIMIT ?
                ) ORDER BY id ASC""",
-            (session_id, marker, limit),
+            (conversation_id, limit),
+        ).fetchall()
+    return [
+        {"role": "user" if r["sender_type"] == "customer" else "assistant",
+         "content": r["content"]}
+        for r in rows
+    ]
+
+
+def add_chat_message(session_id, role, content):
+    """Append a message to the session's current conversation. Returns its id."""
+    sender = SENDER_BY_ROLE.get(role, role)
+    conv = get_or_create_conversation(session_id)
+    return add_message(conv["id"], sender, content)
+
+
+def reset_conversation(session_id):
+    """Close the session's current conversation; the next message starts fresh.
+
+    The message log is never deleted. Returns the closed conversation id, or
+    ``None`` when there was nothing to close.
+    """
+    conv = get_current_conversation(session_id)
+    if not conv:
+        return None
+    close_conversation(conv["id"], by="customer")
+    return conv["id"]
+
+
+def get_recent_messages(session_id, limit=12):
+    """Return the last ``limit`` customer/bot/agent messages, oldest first.
+
+    Uses the session's current (non-closed) conversation, so a reset — which
+    closes the current conversation — hides earlier messages.
+    """
+    conv = get_current_conversation(session_id)
+    if not conv:
+        return []
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM (
+                   SELECT * FROM chat_messages
+                   WHERE conversation_id = ?
+                     AND sender_type IN ('customer', 'bot', 'agent')
+                   ORDER BY id DESC LIMIT ?
+               ) ORDER BY id ASC""",
+            (conv["id"], limit),
         ).fetchall()
     return _rows_to_dicts(rows)
 
 
-# ─── ADMINS ───────────────────────────────────────────────────────────────────
+# ─── ADMINS / AGENTS ──────────────────────────────────────────────────────────
 
 def list_admins():
     """Return admin accounts (id + username) as dicts."""
     with _connect() as conn:
         rows = conn.execute("SELECT id, username FROM admins ORDER BY id").fetchall()
+    return _rows_to_dicts(rows)
+
+
+def list_agents():
+    """Return agent/owner accounts (without password hashes)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT id, username, display_name, role, is_online, last_seen
+               FROM admins ORDER BY id"""
+        ).fetchall()
     return _rows_to_dicts(rows)
 
 
@@ -874,23 +1614,40 @@ def get_admin(username):
     return dict(row) if row else None
 
 
-def create_admin(username, password):
-    """Create an admin with a hashed password. Returns the new id."""
+def get_admin_by_id(admin_id):
+    """Return an admin row (without the hash) or ``None``."""
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT id, username, display_name, role, is_online, last_seen
+               FROM admins WHERE id = ?""",
+            (admin_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_admin(username, password, display_name=None, role="owner"):
+    """Create an admin/agent with a hashed password. Returns the new id."""
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO admins(username, password_hash) VALUES (?, ?)",
-            (username, generate_password_hash(password)),
+            """INSERT INTO admins(username, password_hash, display_name, role)
+               VALUES (?, ?, ?, ?)""",
+            (username, generate_password_hash(password), display_name, role),
         )
     return cur.lastrowid
 
 
-def update_admin(admin_id, username=None, password=None):
-    """Update an admin's username and/or password (re-hashed). Returns True."""
+def update_admin(admin_id, username=None, password=None, display_name=None,
+                 role=None):
+    """Update an admin's username/password/display_name/role. Returns True."""
     updates = {}
     if username:
         updates["username"] = username
     if password:
         updates["password_hash"] = generate_password_hash(password)
+    if display_name is not None:
+        updates["display_name"] = display_name
+    if role:
+        updates["role"] = role
     if not updates:
         return False
     assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -900,6 +1657,28 @@ def update_admin(admin_id, username=None, password=None):
             (*updates.values(), admin_id),
         )
         return cur.rowcount > 0
+
+
+def set_agent_status(agent_id, is_online, touch=True):
+    """Record an agent's online flag and heartbeat timestamp."""
+    now = _now()
+    with _connect() as conn:
+        if touch:
+            conn.execute(
+                "UPDATE admins SET is_online = ?, last_seen = ? WHERE id = ?",
+                (1 if is_online else 0, now, agent_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE admins SET is_online = ? WHERE id = ?",
+                (1 if is_online else 0, agent_id),
+            )
+    return get_admin_by_id(agent_id)
+
+
+def heartbeat(agent_id, is_online=True):
+    """Update an agent's heartbeat (called by the agent UI periodically)."""
+    return set_agent_status(agent_id, is_online, touch=True)
 
 
 def delete_admin(admin_id):
@@ -918,9 +1697,9 @@ def verify_admin(username, password):
 
 
 def ensure_admin(username, password):
-    """Seed a single admin account when the admins table is empty."""
+    """Seed a single owner admin account when the admins table is empty."""
     with _connect() as conn:
         count = conn.execute("SELECT COUNT(*) AS n FROM admins").fetchone()["n"]
     if count == 0:
-        create_admin(username, password)
+        create_admin(username, password, display_name=username, role="owner")
         print(f"[db] Seeded admin account '{username}' (password hashed).")
