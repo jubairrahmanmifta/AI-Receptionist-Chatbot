@@ -1,0 +1,92 @@
+{% extends "admin_base.html" %}
+{% block title %}Services{% endblock %}
+{% block heading %}Services{% endblock %}
+{% block style %}
+  .page-head { display:flex; align-items:flex-start; gap:16px; flex-wrap:wrap;
+               margin-bottom:20px; }
+  .page-head .grow { flex:1; min-width:220px; }
+  .page-head p { font-size:13px; color:var(--muted); margin-top:4px;
+                 line-height:1.55; }
+  .svc-card { background:#fff; border:1px solid var(--line); border-radius:14px;
+              padding:18px 20px; margin-bottom:14px; }
+  .svc-top { display:flex; align-items:flex-start; gap:14px; flex-wrap:wrap; }
+  .svc-top .av { width:44px; height:44px; border-radius:12px; background:#eef2ff;
+                 color:var(--brand); display:grid; place-items:center;
+                 font-size:19px; flex-shrink:0; }
+  .svc-top .who { flex:1; min-width:200px; }
+  .svc-top .who b { font-size:15.5px; }
+  .svc-top .who .bn { display:block; font-size:13px; color:var(--muted);
+                      font-family:'Hind Siliguri','Inter',sans-serif; margin-top:2px; }
+  .svc-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .svc-meta { display:flex; gap:26px; flex-wrap:wrap; margin-top:15px;
+              padding-top:13px; border-top:1px solid var(--line); }
+  .svc-meta .m .k { font-size:11px; text-transform:uppercase; letter-spacing:.5px;
+                    color:var(--muted); font-weight:700; margin-bottom:4px; }
+  .svc-meta .m .v { font-size:13.5px; color:#374151; }
+  .price { font-weight:700; color:var(--ink); }
+  .badge.on  { background:#f0fdf4; color:#15803d; }
+  .badge.pill-off { background:#f3f4f6; color:#6b7280; }
+  form.inline { display:inline; }
+  .empty { text-align:center; padding:56px 20px; background:#fff;
+           border:1px solid var(--line); border-radius:14px; }
+  .empty .ic { font-size:44px; margin-bottom:12px; }
+  .empty p { font-size:15px; color:#9ca3af; margin-bottom:16px; }
+{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div class="grow">
+      <h1 style="font-size:20px;font-weight:800">Services</h1>
+      <p>Treatments and price ranges. Disabled services are hidden from the
+        chatbot but stay linked to past appointments.</p>
+    </div>
+    <a class="btn ghost" href="/admin/settings#prompt-preview">👁 View what the bot sees</a>
+    <a class="btn" href="/admin/services/new">+ Add service</a>
+  </div>
+
+  {% if rows %}
+    {% for row in rows %}
+    {% set s = row.service %}
+    <div class="svc-card">
+      <div class="svc-top">
+        <span class="av">💠</span>
+        <span class="who">
+          <b>{{ s.name_en or s.name_bn or '(unnamed)' }}</b>
+          {% if s.name_bn %}<span class="bn">{{ s.name_bn }}</span>{% endif %}
+        </span>
+        <span class="svc-actions">
+          {% if s.active %}
+          <span class="badge on">● Active</span>
+          {% else %}
+          <span class="badge pill-off">○ Disabled</span>
+          {% endif %}
+          <a class="btn sm ghost" href="/admin/services/{{ s.id }}">✏️ Edit</a>
+          <form class="inline" method="POST" action="/admin/services/{{ s.id }}/toggle">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+            <button class="btn sm ghost" type="submit">
+              {{ 'Disable' if s.active else 'Enable' }}</button>
+          </form>
+          <form class="inline" method="POST" action="/admin/services/{{ s.id }}/delete"
+                onsubmit="return confirm('Delete this service permanently? This only works when no appointment uses it.')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+            <button class="btn sm danger" type="submit">🗑 Delete</button>
+          </form>
+        </span>
+      </div>
+      <div class="svc-meta">
+        <div class="m"><div class="k">Price</div>
+          <div class="v price">{{ format_price(s.price, s.price_max) }}</div></div>
+        <div class="m"><div class="k">Duration</div>
+          <div class="v">{{ s.duration_minutes }} minutes</div></div>
+        <div class="m"><div class="k">Appointments using it</div>
+          <div class="v">{{ row.in_use }}</div></div>
+      </div>
+    </div>
+    {% endfor %}
+  {% else %}
+  <div class="empty">
+    <div class="ic">💠</div>
+    <p>No services yet.</p>
+    <a class="btn" href="/admin/services/new">+ Add the first service</a>
+  </div>
+  {% endif %}
+{% endblock %}

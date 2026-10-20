@@ -3,6 +3,8 @@ import re
 import json
 import time
 import hmac
+import base64
+import hashlib
 import logging
 import datetime
 import functools
@@ -55,9 +57,11 @@ def _apply_cookie_flags():
     app.config["SESSION_COOKIE_SECURE"] = _env_flag("COOKIE_SECURE")
 
 
-# Failed admin logins: 5 per IP *or* per username in 10 minutes blocks that key
-# for 5 more minutes. In-memory on purpose — no background thread, no new deps.
-LOGIN_FAIL_LIMIT   = 5
+# Failed admin logins: 5 per (IP, username) pair *or* 20 per IP across all
+# usernames, in a 10-minute window, blocks that key for 5 more minutes.
+# In-memory on purpose — no background thread, no new deps.
+LOGIN_FAIL_LIMIT    = 5
+LOGIN_IP_FAIL_LIMIT = 20      # looser, across ALL usernames from one address
 LOGIN_FAIL_WINDOW  = 600      # 10 minutes
 LOGIN_BLOCK_SECONDS = 300     # 5 minutes
 _login_failures = {}          # key -> [failure timestamps]
@@ -549,6 +553,12 @@ def _validate_booking(payload, lang):
     slot = str(payload.get("time") or "").strip()
     free = db.get_available_slots(doctor_id, date)
     if slot not in free:
+        # Distinguish "doctor is away" from "that slot is taken" so the bot can
+        # explain the real reason and offer alternatives.
+        if db.is_doctor_off(doctor_id, date):
+            return None, err(
+                "That doctor is away (on leave) on that date.",
+                "ওই তারিখে ডাক্তার ছুটিতে আছেন।")
         return None, err("That time isn't available for that doctor.",
                          "এই সময়টা ওই ডাক্তারের জন্য খালি নেই।")
 
@@ -905,17 +915,23 @@ def _safe_next(target, fallback):
 
 # ─── LOGIN THROTTLE (in-memory) ───────────────────────────────────────────────
 def _login_keys(ip, username):
-    keys = ["ip:%s" % (ip or "unknown")]
-    if username:
-        keys.append("user:%s" % str(username).lower())
+    """Throttle keys for an attempt: the (IP, username) pair, plus a per-IP cap.
+
+    The pair key means one username being attacked from a single address
+    cannot lock that username out from anywhere else. The separate ``ip:`` key
+    is a looser safety net against one address spraying many usernames.
+    """
+    ip = ip or "unknown"
+    keys = [("pair", "pair:%s|%s" % (ip, str(username or "").lower()), LOGIN_FAIL_LIMIT)]
+    keys.append(("ip", "ip:%s" % ip, LOGIN_IP_FAIL_LIMIT))
     return keys
 
 
 def _login_blocked(ip, username):
-    """True while this IP or username is inside a lockout window."""
+    """True while this (IP, username) pair or the whole IP is locked out."""
     now = time.time()
     with _login_lock:
-        for key in _login_keys(ip, username):
+        for _kind, key, _limit in _login_keys(ip, username):
             until = _login_blocks.get(key)
             if until is None:
                 continue
@@ -926,15 +942,15 @@ def _login_blocked(ip, username):
 
 
 def _login_failure(ip, username):
-    """Record a failed attempt; block the key once the limit is reached."""
+    """Record a failed attempt; lock a key once its own limit is reached."""
     now = time.time()
     with _login_lock:
-        for key in _login_keys(ip, username):
+        for _kind, key, limit in _login_keys(ip, username):
             recent = [t for t in _login_failures.get(key, [])
                       if now - t < LOGIN_FAIL_WINDOW]
             recent.append(now)
             _login_failures[key] = recent
-            if len(recent) >= LOGIN_FAIL_LIMIT:
+            if len(recent) >= limit:
                 _login_blocks[key] = now + LOGIN_BLOCK_SECONDS
                 _login_failures.pop(key, None)
 
@@ -942,7 +958,7 @@ def _login_failure(ip, username):
 def _login_success(ip, username):
     """Clear counters for a key once it authenticates successfully."""
     with _login_lock:
-        for key in _login_keys(ip, username):
+        for _kind, key, _limit in _login_keys(ip, username):
             _login_failures.pop(key, None)
             _login_blocks.pop(key, None)
 
@@ -1030,7 +1046,9 @@ def _inject_admin_context():
     if not name and session.get("admin_logged_in"):
         row = db.get_admin_by_id(session.get("admin_id")) or {}
         name = row.get("display_name") or row.get("username") or ""
-    return {"admin_name": name or ""}
+    return {"admin_name": name or "",
+            "format_price": db.format_price,
+            "weekday_names": WEEKDAY_NAMES}
 
 
 @app.route("/admin/login", methods=["GET", "POST"])
@@ -1321,6 +1339,780 @@ def _password_policy_errors(username, new_password, current_password=None):
     if current_password is not None and new_password == current_password:
         errors.append("The new password must be different from the current one.")
     return errors
+
+
+# ─── ADMIN: CATALOG (doctors, days off, services) ──────────────────────────────
+# Validation limits shared by the routes and the templates.
+DOCTOR_NAME_MAX      = 100
+DOCTOR_SPECIALTY_MAX = 120
+DOCTOR_BIO_MAX       = 600
+SLOT_MINUTES_MIN     = 10
+SLOT_MINUTES_MAX     = 120
+SERVICE_NAME_MAX     = 100
+SERVICE_DURATION_MIN = 5
+SERVICE_DURATION_MAX = 480
+SERVICE_PRICE_MAX    = 1_000_000
+TIME_OFF_MAX_DAYS    = 90
+TIME_OFF_REASON_MAX  = 200
+TIME_OFF_MAX_AHEAD   = 365
+
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                 "Friday", "Saturday", "Sunday"]
+WEEKDAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _hhmm(value):
+    """Return minutes for a valid 'HH:MM', else ``None``."""
+    match = TIME_RE.match(str(value or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _is_multiple(value, step):
+    return value % step == 0
+
+
+def _parse_schedule_form(form, slot_minutes):
+    """Parse ``weekday``/``start``/``end`` arrays into validated range rows.
+
+    Returns ``(schedule, errors)``. ``schedule`` is a list of dicts ready for
+    the database; ``errors`` explains anything rejected. Overlapping ranges on
+    the same weekday and ranges shorter than one slot are refused here.
+    """
+    schedule = []
+    errors = []
+    for weekday in range(7):
+        starts = form.getlist("start_%d" % weekday)
+        ends = form.getlist("end_%d" % weekday)
+        if len(starts) != len(ends):
+            errors.append("%s: each range needs both a start and an end time."
+                          % WEEKDAY_NAMES[weekday])
+            continue
+        ranges = []
+        for index, (raw_start, raw_end) in enumerate(zip(starts, ends), start=1):
+            raw_start = (raw_start or "").strip()
+            raw_end = (raw_end or "").strip()
+            if not raw_start and not raw_end:
+                continue
+            label = "%s range %d" % (WEEKDAY_NAMES[weekday], index)
+            start = _hhmm(raw_start)
+            end = _hhmm(raw_end)
+            if start is None:
+                errors.append("%s: '%s' is not a valid time (use HH:MM, "
+                              "e.g. 09:30)." % (label, raw_start))
+                continue
+            if end is None:
+                errors.append("%s: '%s' is not a valid time (use HH:MM, "
+                              "e.g. 17:00)." % (label, raw_end))
+                continue
+            if start >= end:
+                errors.append("%s: the start time must be before the end time."
+                              % label)
+                continue
+            if (end - start) < slot_minutes:
+                errors.append("%s: the range is shorter than one %d-minute "
+                              "slot." % (label, slot_minutes))
+                continue
+            ranges.append((start, end, label))
+        ranges.sort()
+        for (start_a, end_a, label_a), (start_b, _end_b, label_b) in zip(
+                ranges, ranges[1:]):
+            if start_b < end_a:
+                errors.append("%s and %s overlap on %s."
+                              % (label_a, label_b, WEEKDAY_NAMES[weekday]))
+        for start, end, _label in ranges:
+            schedule.append({"weekday": weekday,
+                             "start_time": db._from_minutes(start),
+                             "end_time": db._from_minutes(end)})
+    return schedule, errors
+
+
+def _schedule_summary(schedule, max_ranges=3):
+    """Compact 'Mon 10:00–14:00, Wed 10:00–14:00 (+1 more)' summary."""
+    by_day = {}
+    for row in schedule or []:
+        by_day.setdefault(row["weekday"], []).append(
+            "%s–%s" % (row["start_time"], row["end_time"]))
+    parts = ["%s %s" % (WEEKDAY_SHORT[wd], ", ".join(by_day[wd]))
+             for wd in sorted(by_day)]
+    if not parts:
+        return "No set hours"
+    if len(parts) > max_ranges:
+        return "%s (+%d more)" % (", ".join(parts[:max_ranges]),
+                                  len(parts) - max_ranges)
+    return ", ".join(parts)
+
+
+def _slot_boundary_ok(doctor_id, doctor, date, time_str):
+    """True when ``time_str`` sits on a valid slot boundary of the schedule."""
+    try:
+        day = datetime.date.fromisoformat(date)
+    except (ValueError, TypeError):
+        return False
+    minutes = _hhmm(time_str)
+    if minutes is None:
+        return False
+    slot_minutes = doctor.get("slot_minutes") or 30
+    for row in doctor.get("schedule", []):
+        if row["weekday"] != day.weekday():
+            continue
+        start = _hhmm(row["start_time"])
+        end = _hhmm(row["end_time"])
+        if start is None or end is None or not (start <= minutes < end):
+            continue
+        if _is_multiple(minutes - start, slot_minutes):
+            return True
+    return False
+
+
+def _schedule_impact(doctor, new_schedule, new_slot_minutes, new_active):
+    """Upcoming appointments broken by a proposed doctor change.
+
+    An appointment is affected when the doctor is being disabled, or when its
+    time no longer falls inside the new schedule on a slot boundary, or when
+    it falls inside one of the doctor's days-off ranges. Nothing is cancelled
+    or moved — the owner decides.
+    """
+    doctor_id = doctor["id"]
+    candidate = {
+        "id": doctor_id,
+        "slot_minutes": new_slot_minutes,
+        "active": new_active,
+        "schedule": new_schedule,
+    }
+    affected = []
+    for appt in db.list_upcoming_appointments(doctor_id=doctor_id):
+        reasons = []
+        if not new_active:
+            reasons.append("doctor is disabled")
+        if not _slot_boundary_ok(doctor_id, candidate, appt["date"], appt["time"]):
+            reasons.append("outside the new schedule")
+        if db.is_doctor_off(doctor_id, appt["date"]):
+            reasons.append("doctor is on leave")
+        if reasons:
+            affected.append({
+                "id": appt["id"],
+                "patient_name": appt.get("patient_name"),
+                "phone": appt.get("phone"),
+                "date": appt.get("date"),
+                "time": appt.get("time"),
+                "reasons": reasons,
+            })
+    return affected
+
+
+def _time_off_impact(doctor_id, date_from, date_to):
+    """Upcoming appointments that fall inside a proposed days-off range."""
+    affected = []
+    for appt in db.list_upcoming_appointments(doctor_id=doctor_id):
+        date = appt.get("date") or ""
+        if date_from <= date <= date_to:
+            affected.append({
+                "id": appt["id"],
+                "patient_name": appt.get("patient_name"),
+                "phone": appt.get("phone"),
+                "date": date,
+                "time": appt.get("time"),
+                "reasons": ["inside the days-off range"],
+            })
+    return affected
+
+
+def _impact_token(payload):
+    """Sign a pending change so the confirmation page can't be tampered with.
+
+    The result is base64url so it survives being placed in an HTML attribute
+    without any characters (quotes, braces, spaces) that would be escaped and
+    change the value the browser submits.
+    """
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    sig = hmac.new(app.secret_key.encode("utf-8"), raw.encode("utf-8"),
+                   hashlib.sha256).digest()
+    body = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    tag = base64.urlsafe_b64encode(sig).decode("ascii")
+    return body + "." + tag
+
+
+def _impact_payload(token):
+    """Verify and decode a token from :func:`_impact_token`; None when bad."""
+    body, _sep, tag = str(token or "").partition(".")
+    if not body or not tag:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(body.encode("ascii"))
+        sig = base64.urlsafe_b64decode(tag.encode("ascii"))
+    except (ValueError, TypeError):
+        return None
+    expected = hmac.new(app.secret_key.encode("utf-8"), raw,
+                        hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+
+
+def _schedule_view_rows(doctor=None, form=None):
+    """Build the weekday-grouped rows the schedule editor renders.
+
+    On a failed POST the typed values are kept (and flagged), otherwise the
+    saved schedule is shown.
+    """
+    grouped = {wd: [] for wd in range(7)}
+    if form is not None:
+        slot = 30
+        try:
+            slot = int(form.get("slot_minutes") or 30)
+        except (TypeError, ValueError):
+            slot = 30
+        for weekday in range(7):
+            starts = form.getlist("start_%d" % weekday)
+            ends = form.getlist("end_%d" % weekday)
+            for start, end in zip(starts, ends):
+                grouped[weekday].append({"start_time": (start or "").strip(),
+                                         "end_time": (end or "").strip(),
+                                         "bad": _hhmm(start) is None
+                                                or _hhmm(end) is None
+                                                or (_hhmm(start) or 0) >= (_hhmm(end) or 0)})
+    else:
+        for row in (doctor or {}).get("schedule", []):
+            grouped[row["weekday"]].append({"start_time": row["start_time"],
+                                            "end_time": row["end_time"],
+                                            "bad": False})
+    return grouped
+
+
+def _doctor_form_values(doctor=None):
+    doctor = doctor or {}
+    return {
+        "name_en": doctor.get("name_en") or "",
+        "name_bn": doctor.get("name_bn") or "",
+        "specialty_en": doctor.get("specialty_en") or "",
+        "specialty_bn": doctor.get("specialty_bn") or "",
+        "bio_en": doctor.get("bio_en") or "",
+        "bio_bn": doctor.get("bio_bn") or "",
+        "slot_minutes": doctor.get("slot_minutes") or 30,
+        "active": 1 if doctor.get("active", 1) else 0,
+    }
+
+
+def _validate_doctor_fields(form):
+    """Validate the doctor's plain fields. Returns ``(values, errors)``."""
+    values = {
+        "name_en": (form.get("name_en") or "").strip(),
+        "name_bn": (form.get("name_bn") or "").strip(),
+        "specialty_en": (form.get("specialty_en") or "").strip(),
+        "specialty_bn": (form.get("specialty_bn") or "").strip(),
+        "bio_en": (form.get("bio_en") or "").strip(),
+        "bio_bn": (form.get("bio_bn") or "").strip(),
+        "active": 1 if form.get("active") else 0,
+    }
+    errors = []
+    if not values["name_en"] and not values["name_bn"]:
+        errors.append("A doctor needs a name in English or Bangla.")
+    if len(values["name_en"]) > DOCTOR_NAME_MAX:
+        errors.append("The English name must be %d characters or fewer."
+                      % DOCTOR_NAME_MAX)
+    if len(values["name_bn"]) > DOCTOR_NAME_MAX:
+        errors.append("The Bangla name must be %d characters or fewer."
+                      % DOCTOR_NAME_MAX)
+    if len(values["specialty_en"]) > DOCTOR_SPECIALTY_MAX:
+        errors.append("The English specialty must be %d characters or fewer."
+                      % DOCTOR_SPECIALTY_MAX)
+    if len(values["specialty_bn"]) > DOCTOR_SPECIALTY_MAX:
+        errors.append("The Bangla specialty must be %d characters or fewer."
+                      % DOCTOR_SPECIALTY_MAX)
+    if len(values["bio_en"]) > DOCTOR_BIO_MAX:
+        errors.append("The English bio must be %d characters or fewer."
+                      % DOCTOR_BIO_MAX)
+    if len(values["bio_bn"]) > DOCTOR_BIO_MAX:
+        errors.append("The Bangla bio must be %d characters or fewer."
+                      % DOCTOR_BIO_MAX)
+
+    raw_slot = (form.get("slot_minutes") or "").strip()
+    try:
+        slot_minutes = int(raw_slot)
+    except (TypeError, ValueError):
+        slot_minutes = None
+        errors.append("Slot length must be a whole number of minutes.")
+    if slot_minutes is not None:
+        if not (SLOT_MINUTES_MIN <= slot_minutes <= SLOT_MINUTES_MAX):
+            errors.append("Slot length must be between %d and %d minutes."
+                          % (SLOT_MINUTES_MIN, SLOT_MINUTES_MAX))
+        elif not _is_multiple(slot_minutes, 5):
+            errors.append("Slot length must be a multiple of 5 minutes.")
+        else:
+            values["slot_minutes"] = slot_minutes
+    if "slot_minutes" not in values:
+        values["slot_minutes"] = slot_minutes if slot_minutes else 30
+    return values, errors
+
+
+def _validate_time_off_form(form, doctor_id):
+    """Validate a days-off range. Returns ``(payload, errors)``."""
+    errors = []
+    date_from = (form.get("date_from") or "").strip()
+    date_to = (form.get("date_to") or "").strip()
+    reason = (form.get("reason") or "").strip()
+    start = end = None
+    try:
+        start = datetime.date.fromisoformat(date_from)
+    except (ValueError, TypeError):
+        errors.append("Please choose a valid start date.")
+    try:
+        end = datetime.date.fromisoformat(date_to)
+    except (ValueError, TypeError):
+        errors.append("Please choose a valid end date.")
+    today = db.dhaka_today()
+    if start and end:
+        if end < start:
+            errors.append("The end date must be on or after the start date.")
+        elif start < today:
+            errors.append("Days off can't start in the past.")
+        elif (end - start).days + 1 > TIME_OFF_MAX_DAYS:
+            errors.append("A days-off range can be at most %d days long."
+                          % TIME_OFF_MAX_DAYS)
+        elif (end - today).days > TIME_OFF_MAX_AHEAD:
+            errors.append("Please add days off no more than %d days ahead."
+                          % TIME_OFF_MAX_AHEAD)
+    if len(reason) > TIME_OFF_REASON_MAX:
+        errors.append("The reason must be %d characters or fewer."
+                      % TIME_OFF_REASON_MAX)
+    payload = None
+    if not errors:
+        payload = {"doctor_id": doctor_id, "date_from": date_from,
+                   "date_to": date_to, "reason": reason or None}
+    return payload, errors
+
+
+def _validate_service_form(form):
+    """Validate a service. Returns ``(values, errors)``."""
+    values = {
+        "name_en": (form.get("name_en") or "").strip(),
+        "name_bn": (form.get("name_bn") or "").strip(),
+        "active": 1 if form.get("active") else 0,
+    }
+    errors = []
+    if not values["name_en"] and not values["name_bn"]:
+        errors.append("A service needs a name in English or Bangla.")
+    if len(values["name_en"]) > SERVICE_NAME_MAX:
+        errors.append("The English name must be %d characters or fewer."
+                      % SERVICE_NAME_MAX)
+    if len(values["name_bn"]) > SERVICE_NAME_MAX:
+        errors.append("The Bangla name must be %d characters or fewer."
+                      % SERVICE_NAME_MAX)
+
+    price, raw_price = _parse_price(form.get("price"))
+    if raw_price and price is None:
+        errors.append("The price must be a number of taka (e.g. 500).")
+    elif price is not None and price < 0:
+        errors.append("The price can't be negative.")
+    elif price is not None and price > SERVICE_PRICE_MAX:
+        errors.append("That price looks unrealistic — please check it.")
+    values["price"] = price
+
+    price_max, raw_max = _parse_price(form.get("price_max"))
+    if raw_max and price_max is None:
+        errors.append("The maximum price must be a number of taka.")
+    elif price_max is not None:
+        if price_max < 0:
+            errors.append("The maximum price can't be negative.")
+        elif price_max > SERVICE_PRICE_MAX:
+            errors.append("That price looks unrealistic — please check it.")
+        elif price is not None and price_max < price:
+            errors.append("The maximum price must be greater than or equal to "
+                          "the minimum price.")
+    values["price_max"] = price_max
+
+    raw_duration = (form.get("duration_minutes") or "").strip()
+    try:
+        duration = int(raw_duration)
+    except (TypeError, ValueError):
+        duration = None
+        errors.append("Duration must be a whole number of minutes.")
+    if duration is not None:
+        if not (SERVICE_DURATION_MIN <= duration <= SERVICE_DURATION_MAX):
+            errors.append("Duration must be between %d and %d minutes."
+                          % (SERVICE_DURATION_MIN, SERVICE_DURATION_MAX))
+        elif not _is_multiple(duration, 5):
+            errors.append("Duration must be a multiple of 5 minutes.")
+        else:
+            values["duration_minutes"] = duration
+    if "duration_minutes" not in values:
+        values["duration_minutes"] = duration or 30
+    return values, errors
+
+
+def _parse_price(raw):
+    """Return ``(value_or_None, raw_string)`` — empty input means ``None``."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None, ""
+    try:
+        return float(raw), raw
+    except (TypeError, ValueError):
+        return None, raw
+
+
+def _doctor_list_row(doctor):
+    """Extra display data for the doctors list."""
+    schedule = doctor.get("schedule") or []
+    today = db.dhaka_today().isoformat()
+    return {
+        "doctor": doctor,
+        "summary": _schedule_summary(schedule),
+        "upcoming": db.count_appointments_for_doctor(
+            doctor["id"], upcoming_only=True, from_date=today),
+    }
+
+
+def _service_list_row(service):
+    return {
+        "service": service,
+        "in_use": db.count_appointments_for_service(service["id"]),
+        "total": db.count_all_appointments_for_service(service["id"]),
+    }
+
+
+@app.route("/admin/doctors")
+@owner_required
+def admin_doctors():
+    rows = [_doctor_list_row(doc) for doc in db.list_doctors()]
+    time_off_by_doctor = {}
+    for item in db.list_time_off_days(days=365):
+        time_off_by_doctor.setdefault(item["doctor_id"], []).append(item)
+    return render_template("admin_doctors.html", nav="doctors", rows=rows,
+                           weekday_names=WEEKDAY_NAMES,
+                           time_off_by_doctor=time_off_by_doctor)
+
+
+@app.route("/admin/doctors/new", methods=["GET", "POST"])
+@owner_required
+def admin_doctor_new():
+    values = _doctor_form_values()
+    errors = []
+    if request.method == "POST":
+        values, errors = _validate_doctor_fields(request.form)
+        schedule, sched_errors = _parse_schedule_form(
+            request.form, values["slot_minutes"])
+        errors.extend(sched_errors)
+        if not errors and not schedule and values["active"]:
+            errors.append("An active doctor needs at least one weekly range — "
+                          "otherwise no slots can be offered.")
+        if not errors:
+            doctor_id = db.create_doctor(
+                name_en=values["name_en"], name_bn=values["name_bn"],
+                specialty_en=values["specialty_en"],
+                specialty_bn=values["specialty_bn"],
+                bio_en=values["bio_en"], bio_bn=values["bio_bn"],
+                slot_minutes=values["slot_minutes"], active=values["active"],
+                schedule=schedule)
+            flash("%s was added." % (values["name_en"] or values["name_bn"]),
+                  "success")
+            return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
+    return render_template("admin_doctor_edit.html", nav="doctors",
+                           mode="new", doctor=None, values=values,
+                           schedule=_schedule_view_rows(
+                               form=request.form if request.method == "POST"
+                               else None),
+                           errors=errors,
+                           weekday_names=WEEKDAY_NAMES,
+                           time_off=[],
+                           slot_min=SLOT_MINUTES_MIN,
+                           slot_max=SLOT_MINUTES_MAX)
+
+
+@app.route("/admin/doctors/<int:doctor_id>", methods=["GET", "POST"])
+@owner_required
+def admin_doctor_edit(doctor_id):
+    doctor = db.get_doctor(doctor_id)
+    if doctor is None:
+        flash("That doctor no longer exists.", "error")
+        return redirect(url_for("admin_doctors"))
+    errors = []
+
+    if request.method == "POST":
+        if request.form.get("action") == "add_time_off":
+            return _admin_add_time_off(doctor)
+
+        confirmed = request.form.get("impact_token") == "confirmed"
+        values, errors = _validate_doctor_fields(request.form)
+        schedule, sched_errors = _parse_schedule_form(
+            request.form, values["slot_minutes"])
+        errors.extend(sched_errors)
+        if not errors:
+            # Impact first: removing hours may strand bookings, and the owner
+            # must see those appointments before anything changes. The
+            # "needs a weekly range" rule is applied once they confirm.
+            affected = _schedule_impact(doctor, schedule,
+                                        values["slot_minutes"],
+                                        values["active"])
+            if affected and not confirmed:
+                # Nothing is written yet: show exactly what would break.
+                payload = {"kind": "doctor", "doctor_id": doctor_id,
+                           "values": values, "schedule": schedule}
+                return render_template(
+                    "admin_confirm_impact.html", nav="doctors",
+                    impact="doctor", doctor=doctor, affected=affected,
+                    back_url=url_for("admin_doctor_edit",
+                                     doctor_id=doctor_id),
+                    token=_impact_token(payload),
+                    summary="Saving this would affect %d upcoming "
+                            "appointment%s." % (len(affected),
+                                                "s" if len(affected) != 1 else ""))
+            if not schedule and values["active"]:
+                errors.append("An active doctor needs at least one weekly range "
+                              "— otherwise no slots can be offered.")
+        if not errors:
+            db.save_doctor_with_schedule(doctor_id, schedule=schedule, **values)
+            flash("Doctor updated.", "success")
+            return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
+
+        # A failed save: keep exactly what was typed.
+        return render_template("admin_doctor_edit.html", nav="doctors",
+                               mode="edit", doctor=doctor, values=values,
+                               schedule=_schedule_view_rows(form=request.form),
+                               errors=errors,
+                               weekday_names=WEEKDAY_NAMES,
+                               time_off=db.list_doctor_time_off(
+                                   doctor_id, upcoming_only=True),
+                               slot_min=SLOT_MINUTES_MIN,
+                               slot_max=SLOT_MINUTES_MAX)
+
+    return render_template("admin_doctor_edit.html", nav="doctors",
+                           mode="edit", doctor=doctor,
+                           values=_doctor_form_values(doctor),
+                           schedule=_schedule_view_rows(doctor=doctor),
+                           errors=errors,
+                           weekday_names=WEEKDAY_NAMES,
+                           time_off=db.list_doctor_time_off(
+                               doctor_id, upcoming_only=True),
+                           slot_min=SLOT_MINUTES_MIN,
+                           slot_max=SLOT_MINUTES_MAX)
+
+
+def _admin_add_time_off(doctor):
+    """Handle the add-days-off form (with the same impact confirmation)."""
+    doctor_id = doctor["id"]
+    payload, errors = _validate_time_off_form(request.form, doctor_id)
+    if errors:
+        return render_template(
+            "admin_doctor_edit.html", nav="doctors", mode="edit",
+            doctor=doctor, values=_doctor_form_values(doctor),
+            schedule=_schedule_view_rows(doctor=doctor),
+            errors=errors, weekday_names=WEEKDAY_NAMES,
+            time_off=db.list_doctor_time_off(doctor_id, upcoming_only=True),
+            slot_min=SLOT_MINUTES_MIN, slot_max=SLOT_MINUTES_MAX)
+    affected = _time_off_impact(doctor_id, payload["date_from"],
+                                payload["date_to"])
+    if affected and request.form.get("impact_token") != "confirmed":
+        return render_template(
+            "admin_confirm_impact.html", nav="doctors", impact="time_off",
+            doctor=doctor, affected=affected,
+            back_url=url_for("admin_doctor_edit", doctor_id=doctor_id),
+            token=_impact_token({"kind": "time_off", **payload}),
+            summary="%d upcoming appointment%s fall%s inside this days-off "
+                    "range." % (len(affected),
+                                "s" if len(affected) != 1 else "",
+                                "" if len(affected) != 1 else "s"))
+    db.create_time_off(doctor_id, payload["date_from"], payload["date_to"],
+                       payload["reason"])
+    flash("Days off added — the doctor is now unavailable on those dates.",
+          "success")
+    return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
+
+
+@app.route("/admin/doctors/<int:doctor_id>/time-off/<int:time_off_id>/delete",
+           methods=["POST"])
+@owner_required
+def admin_time_off_delete(doctor_id, time_off_id):
+    row = db.get_time_off(time_off_id)
+    if row is None or row["doctor_id"] != doctor_id:
+        flash("That days-off range no longer exists.", "error")
+    elif db.delete_time_off(time_off_id):
+        flash("Days off removed.", "success")
+    else:
+        flash("That days-off range no longer exists.", "error")
+    return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
+
+
+@app.route("/admin/doctors/<int:doctor_id>/toggle", methods=["POST"])
+@owner_required
+def admin_doctor_toggle(doctor_id):
+    doctor = db.get_doctor(doctor_id)
+    if doctor is None:
+        flash("That doctor no longer exists.", "error")
+        return redirect(url_for("admin_doctors"))
+    new_active = 0 if doctor.get("active") else 1
+    if not new_active:
+        affected = _schedule_impact(doctor, doctor.get("schedule") or [],
+                                    doctor.get("slot_minutes"),
+                                    new_active)
+        if affected and request.form.get("impact_token") != "confirmed":
+            payload = {"kind": "disable_doctor", "doctor_id": doctor_id,
+                       "affected": affected}
+            return render_template(
+                "admin_confirm_impact.html", nav="doctors",
+                impact="disable_doctor", doctor=doctor, affected=affected,
+                back_url=url_for("admin_doctors"),
+                token=_impact_token(payload),
+                summary="Disabling %s would affect %d upcoming appointment%s."
+                        % (doctor.get("name_en") or doctor.get("name_bn"),
+                           len(affected), "s" if len(affected) != 1 else ""))
+    db.update_doctor(doctor_id, active=new_active)
+    flash("%s is now %s." % (doctor.get("name_en") or doctor.get("name_bn"),
+                             "enabled" if new_active else "disabled"),
+          "success")
+    return redirect(url_for("admin_doctors"))
+
+
+@app.route("/admin/doctors/<int:doctor_id>/delete", methods=["POST"])
+@owner_required
+def admin_doctor_delete(doctor_id):
+    doctor = db.get_doctor(doctor_id)
+    if doctor is None:
+        flash("That doctor no longer exists.", "error")
+        return redirect(url_for("admin_doctors"))
+    total = db.count_all_appointments_for_doctor(doctor_id)
+    if total:
+        flash("%s has %d appointment%s on record, so it can't be deleted. "
+              "Disable the doctor instead to hide them from the chatbot."
+              % (doctor.get("name_en") or doctor.get("name_bn"), total,
+                 "s" if total != 1 else ""), "error")
+        return redirect(url_for("admin_doctors"))
+    db.delete_doctor(doctor_id)
+    flash("Doctor deleted.", "success")
+    return redirect(url_for("admin_doctors"))
+
+
+@app.route("/admin/services")
+@owner_required
+def admin_services():
+    rows = [_service_list_row(svc) for svc in db.list_services()]
+    return render_template("admin_services.html", nav="services", rows=rows)
+
+
+@app.route("/admin/services/new", methods=["GET", "POST"])
+@owner_required
+def admin_service_new():
+    values = {"name_en": "", "name_bn": "", "price": "", "price_max": "",
+              "duration_minutes": 30, "active": 1}
+    errors = []
+    if request.method == "POST":
+        values, errors = _validate_service_form(request.form)
+        if not errors:
+            db.create_service(**values)
+            flash("%s was added." % (values["name_en"] or values["name_bn"]),
+                  "success")
+            return redirect(url_for("admin_services"))
+    return render_template("admin_service_edit.html", nav="services",
+                           mode="new", service=None, values=values,
+                           errors=errors,
+                           duration_min=SERVICE_DURATION_MIN,
+                           duration_max=SERVICE_DURATION_MAX)
+
+
+@app.route("/admin/services/<int:service_id>", methods=["GET", "POST"])
+@owner_required
+def admin_service_edit(service_id):
+    service = db.get_service(service_id)
+    if service is None:
+        flash("That service no longer exists.", "error")
+        return redirect(url_for("admin_services"))
+    values = {"name_en": service.get("name_en") or "",
+              "name_bn": service.get("name_bn") or "",
+              "price": "" if service.get("price") is None else service["price"],
+              "price_max": ("" if service.get("price_max") is None
+                            else service["price_max"]),
+              "duration_minutes": service.get("duration_minutes") or 30,
+              "active": 1 if service.get("active", 1) else 0}
+    errors = []
+    if request.method == "POST":
+        values, errors = _validate_service_form(request.form)
+        if not errors:
+            db.update_service(service_id, **values)
+            flash("Service updated.", "success")
+            return redirect(url_for("admin_services"))
+    return render_template("admin_service_edit.html", nav="services",
+                           mode="edit", service=service, values=values,
+                           errors=errors,
+                           duration_min=SERVICE_DURATION_MIN,
+                           duration_max=SERVICE_DURATION_MAX)
+
+
+@app.route("/admin/services/<int:service_id>/toggle", methods=["POST"])
+@owner_required
+def admin_service_toggle(service_id):
+    service = db.get_service(service_id)
+    if service is None:
+        flash("That service no longer exists.", "error")
+        return redirect(url_for("admin_services"))
+    new_active = 0 if service.get("active") else 1
+    db.update_service(service_id, active=new_active)
+    flash("%s is now %s." % (service.get("name_en") or service.get("name_bn"),
+                             "enabled" if new_active else "disabled"),
+          "success")
+    return redirect(url_for("admin_services"))
+
+
+@app.route("/admin/services/<int:service_id>/delete", methods=["POST"])
+@owner_required
+def admin_service_delete(service_id):
+    service = db.get_service(service_id)
+    if service is None:
+        flash("That service no longer exists.", "error")
+        return redirect(url_for("admin_services"))
+    total = db.count_all_appointments_for_service(service_id)
+    if total:
+        flash("%s is used by %d appointment%s, so it can't be deleted. "
+              "Disable the service instead to hide it from the chatbot."
+              % (service.get("name_en") or service.get("name_bn"), total,
+                 "s" if total != 1 else ""), "error")
+        return redirect(url_for("admin_services"))
+    db.delete_service(service_id)
+    flash("Service deleted.", "success")
+    return redirect(url_for("admin_services"))
+
+
+@app.route("/admin/confirm-impact", methods=["POST"])
+@owner_required
+def admin_confirm_impact():
+    """Apply a change the owner has explicitly confirmed on the warning page."""
+    payload = _impact_payload(request.form.get("impact_token"))
+    if not payload:
+        flash("That confirmation expired. Please make the change again.",
+              "error")
+        return redirect(url_for("admin_doctors"))
+    kind = payload.get("kind")
+    if kind == "doctor":
+        doctor_id = payload.get("doctor_id")
+        if db.get_doctor(doctor_id):
+            db.save_doctor_with_schedule(doctor_id,
+                                         schedule=payload.get("schedule"),
+                                         **payload.get("values", {}))
+            flash("Doctor updated. The listed appointments were left "
+                  "untouched.", "success")
+        return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
+    if kind == "time_off":
+        doctor_id = payload.get("doctor_id")
+        if db.get_doctor(doctor_id):
+            db.create_time_off(doctor_id, payload["date_from"],
+                               payload["date_to"], payload.get("reason"))
+            flash("Days off added. The listed appointments were left "
+                  "untouched.", "success")
+        return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
+    if kind == "disable_doctor":
+        doctor_id = payload.get("doctor_id")
+        if db.get_doctor(doctor_id):
+            db.update_doctor(doctor_id, active=0)
+            flash("Doctor disabled. The listed appointments were left "
+                  "untouched.", "success")
+        return redirect(url_for("admin_doctors"))
+    flash("Nothing was changed.", "error")
+    return redirect(url_for("admin_doctors"))
 
 
 # ─── ROUTES — AGENT (login + JSON API) ────────────────────────────────────────

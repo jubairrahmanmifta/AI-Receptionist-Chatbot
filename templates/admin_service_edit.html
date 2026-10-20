@@ -1,0 +1,93 @@
+{% extends "admin_base.html" %}
+{% block title %}{{ 'New service' if mode == 'new' else 'Edit service' }}{% endblock %}
+{% block heading %}{{ 'New service' if mode == 'new' else 'Edit service' }}{% endblock %}
+{% block style %}
+  .back { font-size:13px; color:var(--brand); text-decoration:none;
+          display:inline-block; margin-bottom:14px; }
+  .back:hover { text-decoration:underline; }
+  .toggle-row { display:flex; align-items:center; gap:10px; margin-top:6px; }
+  .toggle-row input { width:17px; height:17px; accent-color:var(--brand); }
+  .toggle-row label { font-size:13.5px; color:#374151; }
+  .sticky-actions { position:sticky; bottom:0; background:rgba(240,244,255,.94);
+                    backdrop-filter:blur(4px); padding:14px 0 4px; margin-top:8px;
+                    display:flex; gap:10px; align-items:center; }
+{% endblock %}
+{% block content %}
+  <a class="back" href="/admin/services">← Back to services</a>
+
+  {% if errors %}
+  <div class="err-list">
+    <strong>Please fix the following:</strong>
+    <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  <form method="POST"
+        action="{{ '/admin/services/new' if mode == 'new' else '/admin/services/' ~ service.id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+
+    <div class="card">
+      <h2>💠 Service details</h2>
+      <p class="hint">At least one name is required. Prices are shown to
+        patients as a range — leave the maximum blank for a single price.</p>
+      <div class="grid2">
+        <div class="field">
+          <label class="f" for="name_en">Name (English)</label>
+          <input class="inp" type="text" id="name_en" name="name_en"
+                 value="{{ values.name_en }}" maxlength="100"/>
+        </div>
+        <div class="field">
+          <label class="f" for="name_bn">নাম (বাংলা)</label>
+          <input class="inp" type="text" id="name_bn" name="name_bn"
+                 value="{{ values.name_bn }}" maxlength="100"/>
+        </div>
+        <div class="field">
+          <label class="f" for="price">Minimum price (৳)</label>
+          <input class="inp" type="number" id="price" name="price"
+                 value="{{ values.price }}" min="0" step="1" inputmode="decimal"/>
+          <div class="help">Taka, e.g. 500. Leave blank if the price varies.</div>
+        </div>
+        <div class="field">
+          <label class="f" for="price_max">Maximum price (৳)
+            <span class="opt">— optional</span></label>
+          <input class="inp" type="number" id="price_max" name="price_max"
+                 value="{{ values.price_max }}" min="0" step="1" inputmode="decimal"/>
+          <div class="help">Must be at least the minimum price.</div>
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="field">
+          <label class="f" for="duration_minutes">Duration (minutes)</label>
+          <input class="inp" type="number" id="duration_minutes"
+                 name="duration_minutes" value="{{ values.duration_minutes }}"
+                 min="{{ duration_min }}" max="{{ duration_max }}" step="5"
+                 inputmode="numeric" required/>
+          <div class="help">{{ duration_min }}–{{ duration_max }} minutes, in steps of 5.</div>
+        </div>
+        <div class="field">
+          <label class="f">Availability</label>
+          <div class="toggle-row">
+            <input type="checkbox" id="active" name="active" value="1"
+                   {{ 'checked' if values.active }}/>
+            <label for="active">Service is active (visible to the chatbot)</label>
+          </div>
+          <div class="help">Disabled services are hidden from the chatbot but
+            stay linked to past appointments.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sticky-actions">
+      <button class="btn" type="submit">
+        {{ 'Create service' if mode == 'new' else '💾 Save changes' }}</button>
+      <span class="help">Changes reach the chatbot immediately — no restart.</span>
+    </div>
+  </form>
+
+  <div class="card">
+    <h2>👁 What the bot sees</h2>
+    <p class="hint">The prompt is rebuilt on every message, so your changes are
+      live. Open the preview to read the exact system prompt.</p>
+    <a class="btn ghost" href="/admin/settings#prompt-preview">View the BN / EN prompt</a>
+  </div>
+{% endblock %}

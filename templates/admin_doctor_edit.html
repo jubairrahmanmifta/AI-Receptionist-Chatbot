@@ -1,0 +1,266 @@
+{% extends "admin_base.html" %}
+{% block title %}{{ 'New doctor' if mode == 'new' else 'Edit doctor' }}{% endblock %}
+{% block heading %}{{ 'New doctor' if mode == 'new' else 'Edit doctor' }}{% endblock %}
+{% block style %}
+  .back { font-size:13px; color:var(--brand); text-decoration:none;
+          display:inline-block; margin-bottom:14px; }
+  .back:hover { text-decoration:underline; }
+  .day { border:1px solid var(--line); border-radius:11px; padding:12px 14px;
+         margin-bottom:10px; background:#fbfcfe; }
+  .day-head { display:flex; align-items:center; gap:10px; }
+  .day-head b { font-size:13.5px; flex:1; }
+  .range-row { display:flex; align-items:center; gap:8px; margin-top:9px;
+               flex-wrap:wrap; }
+  .range-row input[type="time"] { padding:8px 10px; border:1.5px solid var(--line);
+              border-radius:8px; font-size:13.5px; font-family:inherit;
+              outline:none; background:#fff; }
+  .range-row input[type="time"]:focus { border-color:var(--brand); }
+  .range-row input.bad { border-color:var(--danger); background:#fef2f2; }
+  .range-row .dash { color:var(--muted); font-size:13px; }
+  .rm { padding:7px 12px; font-size:12.5px; border:1px solid #fecaca;
+        background:#fff; color:var(--danger); border-radius:8px; cursor:pointer;
+        font-family:inherit; }
+  .rm:hover { background:#fef2f2; }
+  .add-range { margin-top:9px; padding:6px 13px; font-size:12.5px;
+               border:1px dashed #c7d2fe; background:#fff; color:var(--brand);
+               border-radius:8px; cursor:pointer; font-family:inherit;
+               font-weight:600; }
+  .add-range:hover { background:#eef2ff; }
+  .off-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+             padding:11px 0; border-bottom:1px solid #f3f4f6; font-size:13.5px; }
+  .off-row:last-child { border-bottom:none; }
+  .off-row .dates { font-weight:600; min-width:190px; }
+  .off-row .reason { color:var(--muted); flex:1; }
+  .toggle-row { display:flex; align-items:center; gap:10px; margin-top:6px; }
+  .toggle-row input { width:17px; height:17px; accent-color:var(--brand); }
+  .toggle-row label { font-size:13.5px; color:#374151; }
+  .sticky-actions { position:sticky; bottom:0; background:rgba(240,244,255,.94);
+                    backdrop-filter:blur(4px); padding:14px 0 4px; margin-top:8px;
+                    display:flex; gap:10px; align-items:center; }
+  @media (max-width:640px) { .off-row .dates { min-width:0; } }
+{% endblock %}
+{% block content %}
+  <a class="back" href="/admin/doctors">← Back to doctors</a>
+
+  {% if errors %}
+  <div class="err-list">
+    <strong>Please fix the following:</strong>
+    <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  <form method="POST"
+        action="{{ '/admin/doctors/new' if mode == 'new' else '/admin/doctors/' ~ doctor.id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+
+    <div class="card">
+      <h2>👤 Doctor details</h2>
+      <p class="hint">Shown to patients and used by the chatbot. Fill in
+        whichever language you have — at least one name is required.</p>
+      <div class="grid2">
+        <div class="field">
+          <label class="f" for="name_en">Name (English)</label>
+          <input class="inp" type="text" id="name_en" name="name_en"
+                 value="{{ values.name_en }}" maxlength="100"/>
+        </div>
+        <div class="field">
+          <label class="f" for="name_bn">নাম (বাংলা)</label>
+          <input class="inp" type="text" id="name_bn" name="name_bn"
+                 value="{{ values.name_bn }}" maxlength="100"/>
+        </div>
+        <div class="field">
+          <label class="f" for="specialty_en">Specialty (English)</label>
+          <input class="inp" type="text" id="specialty_en" name="specialty_en"
+                 value="{{ values.specialty_en }}" maxlength="120"/>
+        </div>
+        <div class="field">
+          <label class="f" for="specialty_bn">বিশেষত্ব (বাংলা)</label>
+          <input class="inp" type="text" id="specialty_bn" name="specialty_bn"
+                 value="{{ values.specialty_bn }}" maxlength="120"/>
+        </div>
+      </div>
+      <div class="field">
+        <label class="f" for="bio_en">Bio (English)
+          <span class="opt">— optional</span></label>
+        <textarea class="inp" id="bio_en" name="bio_en" maxlength="600"
+                  placeholder="Qualifications, interests…">{{ values.bio_en }}</textarea>
+        <div class="help">Max 600 characters.</div>
+      </div>
+      <div class="field">
+        <label class="f" for="bio_bn">পরিচিতি (বাংলা)
+          <span class="opt">— ইচ্ছা হলে</span></label>
+        <textarea class="inp" id="bio_bn" name="bio_bn" maxlength="600"
+                  placeholder="যোগ্যতা, অভিজ্ঞতা…">{{ values.bio_bn }}</textarea>
+        <div class="help">সর্বোচ্চ ৬০০ অক্ষর।</div>
+      </div>
+      <div class="grid2">
+        <div class="field">
+          <label class="f" for="slot_minutes">Slot length (minutes)</label>
+          <input class="inp" type="number" id="slot_minutes" name="slot_minutes"
+                 value="{{ values.slot_minutes }}" min="{{ slot_min }}" max="{{ slot_max }}"
+                 step="5" inputmode="numeric" required/>
+          <div class="help">{{ slot_min }}–{{ slot_max }} minutes, in steps of 5.</div>
+        </div>
+        <div class="field">
+          <label class="f">Availability</label>
+          <div class="toggle-row">
+            <input type="checkbox" id="active" name="active" value="1"
+                   {{ 'checked' if values.active }}/>
+            <label for="active">Doctor is active (visible to the chatbot)</label>
+          </div>
+          <div class="help">Disabled doctors keep their history but are hidden
+            from the chatbot and from slot suggestions.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🗓 Weekly schedule</h2>
+      <p class="hint">Add one or more ranges per weekday. Each range must be at
+        least one slot long, and ranges on the same day must not overlap.</p>
+      <div id="schedule">
+        {% for wd in range(7) %}
+        <div class="day" data-weekday="{{ wd }}">
+          <div class="day-head">
+            <b>{{ weekday_names[wd] }}</b>
+          </div>
+          <div class="ranges">
+            {% for r in schedule[wd] %}
+            <div class="range-row">
+              <input type="time" name="start_{{ wd }}" value="{{ r.start_time }}"
+                     class="{{ 'bad' if r.bad }}"/>
+              <span class="dash">to</span>
+              <input type="time" name="end_{{ wd }}" value="{{ r.end_time }}"
+                     class="{{ 'bad' if r.bad }}"/>
+              <button class="rm" type="button">Remove</button>
+            </div>
+            {% endfor %}
+          </div>
+          <button class="add-range" type="button" data-weekday="{{ wd }}">
+            + Add range</button>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="sticky-actions">
+      <button class="btn" type="submit">
+        {{ 'Create doctor' if mode == 'new' else '💾 Save changes' }}</button>
+      <span class="help">Changes reach the chatbot immediately — no restart.</span>
+    </div>
+  </form>
+
+  {% if mode == 'edit' %}
+  <div class="card" style="margin-top:20px">
+    <h2>🏖 Days off</h2>
+    <p class="hint">The chatbot stops offering these dates and can explain why
+      the doctor is unavailable.</p>
+
+    {% if time_off %}
+      {% for off in time_off %}
+      <div class="off-row">
+        <span class="dates">
+          {{ off.date_from }}{% if off.date_to != off.date_from %} → {{ off.date_to }}{% endif %}
+        </span>
+        <span class="reason">{{ off.reason or '' }}</span>
+        <form method="POST" action="/admin/doctors/{{ doctor.id }}/time-off/{{ off.id }}/delete"
+              onsubmit="return confirm('Remove this days-off range?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+          <button class="btn sm danger" type="submit">Remove</button>
+        </form>
+      </div>
+      {% endfor %}
+    {% else %}
+      <p class="help" style="margin-bottom:6px">No upcoming days off.</p>
+    {% endif %}
+
+    {# Separate form: adding days off is its own POST action. #}
+    <form method="POST" action="/admin/doctors/{{ doctor.id }}"
+          style="margin-top:16px">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+      <input type="hidden" name="action" value="add_time_off"/>
+      <div class="grid3">
+        <div class="field">
+          <label class="f" for="date_from">From</label>
+          <input class="inp" type="date" id="date_from" name="date_from" required/>
+        </div>
+        <div class="field">
+          <label class="f" for="date_to">To</label>
+          <input class="inp" type="date" id="date_to" name="date_to" required/>
+        </div>
+        <div class="field">
+          <label class="f" for="reason">Reason
+            <span class="opt">— optional</span></label>
+          <input class="inp" type="text" id="reason" name="reason" maxlength="200"
+                 placeholder="Conference, sick leave…"/>
+        </div>
+      </div>
+      <button class="btn ghost" type="submit">+ Add days off</button>
+      <div class="help">Up to 90 days per range, starting today or later.</div>
+    </form>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <h2>👁 What the bot sees</h2>
+    <p class="hint">The prompt is rebuilt on every message, so your changes are
+      live. Open the preview to read the exact system prompt.</p>
+    <a class="btn ghost" href="/admin/settings#prompt-preview">View the BN / EN prompt</a>
+  </div>
+{% endblock %}
+
+{% block page_js %}
+<script>
+(function () {
+  "use strict";
+  var schedule = document.getElementById("schedule");
+  if (!schedule) { return; }
+
+  // One row builder per weekday; values are only ever set as input values,
+  // never written as HTML.
+  function makeRow(weekday) {
+    var row = document.createElement("div");
+    row.className = "range-row";
+
+    var start = document.createElement("input");
+    start.type = "time";
+    start.name = "start_" + weekday;
+
+    var dash = document.createElement("span");
+    dash.className = "dash";
+    dash.textContent = "to";
+
+    var end = document.createElement("input");
+    end.type = "time";
+    end.name = "end_" + weekday;
+
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "rm";
+    remove.textContent = "Remove";
+
+    row.appendChild(start);
+    row.appendChild(dash);
+    row.appendChild(end);
+    row.appendChild(remove);
+    return row;
+  }
+
+  schedule.addEventListener("click", function (ev) {
+    var target = ev.target;
+    if (target.classList.contains("add-range")) {
+      var weekday = target.getAttribute("data-weekday");
+      var day = target.closest(".day");
+      var ranges = day.querySelector(".ranges");
+      var row = makeRow(weekday);
+      ranges.appendChild(row);
+      var first = row.querySelector('input[type="time"]');
+      if (first) { first.focus(); }
+    } else if (target.classList.contains("rm")) {
+      var parent = target.closest(".range-row");
+      if (parent) { parent.remove(); }
+    }
+  });
+}());
+</script>
+{% endblock %}

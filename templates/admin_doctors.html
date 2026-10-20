@@ -1,0 +1,104 @@
+{% extends "admin_base.html" %}
+{% block title %}Doctors{% endblock %}
+{% block heading %}Doctors{% endblock %}
+{% block style %}
+  .page-head { display:flex; align-items:flex-start; gap:16px; flex-wrap:wrap;
+               margin-bottom:20px; }
+  .page-head .grow { flex:1; min-width:220px; }
+  .page-head p { font-size:13px; color:var(--muted); margin-top:4px;
+                 line-height:1.55; }
+  .doc-card { background:#fff; border:1px solid var(--line); border-radius:14px;
+              padding:20px; margin-bottom:16px; }
+  .doc-top { display:flex; align-items:flex-start; gap:14px; flex-wrap:wrap; }
+  .doc-top .av { width:44px; height:44px; border-radius:50%; background:#eef2ff;
+                 color:var(--brand); display:grid; place-items:center;
+                 font-size:18px; font-weight:700; flex-shrink:0; }
+  .doc-top .who { flex:1; min-width:200px; }
+  .doc-top .who b { font-size:15.5px; }
+  .doc-top .who .bn { display:block; font-size:13px; color:var(--muted);
+                      font-family:'Hind Siliguri','Inter',sans-serif; margin-top:2px; }
+  .doc-top .who .sp { display:block; font-size:12.5px; color:#374151; margin-top:5px; }
+  .doc-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .doc-meta { display:flex; gap:22px; flex-wrap:wrap; margin-top:16px;
+              padding-top:14px; border-top:1px solid var(--line); }
+  .doc-meta .m { min-width:150px; }
+  .doc-meta .m .k { font-size:11px; text-transform:uppercase; letter-spacing:.5px;
+                    color:var(--muted); font-weight:700; margin-bottom:4px; }
+  .doc-meta .m .v { font-size:13px; color:#374151; line-height:1.5; }
+  .badge.on  { background:#f0fdf4; color:#15803d; }
+  .badge.pill-off { background:#f3f4f6; color:#6b7280; }
+  form.inline { display:inline; }
+  .empty { text-align:center; padding:56px 20px; background:#fff;
+           border:1px solid var(--line); border-radius:14px; }
+  .empty .ic { font-size:44px; margin-bottom:12px; }
+  .empty p { font-size:15px; color:#9ca3af; margin-bottom:16px; }
+  @media (max-width:640px) { .doc-actions { width:100%; } }
+{% endblock %}
+{% block content %}
+  <div class="page-head">
+    <div class="grow">
+      <h1 style="font-size:20px;font-weight:800">Doctors</h1>
+      <p>Doctors and their weekly hours. Disabled doctors keep their history
+        but disappear from the chatbot and from slot suggestions.</p>
+    </div>
+    <a class="btn ghost" href="/admin/settings#prompt-preview">👁 View what the bot sees</a>
+    <a class="btn" href="/admin/doctors/new">+ Add doctor</a>
+  </div>
+
+  {% if rows %}
+    {% for row in rows %}
+    {% set d = row.doctor %}
+    <div class="doc-card">
+      <div class="doc-top">
+        <span class="av">{{ (d.name_en or d.name_bn or '?')[:1]|upper }}</span>
+        <span class="who">
+          <b>{{ d.name_en or d.name_bn or '(unnamed)' }}</b>
+          {% if d.name_bn %}<span class="bn">{{ d.name_bn }}</span>{% endif %}
+          {% if d.specialty_en or d.specialty_bn %}
+          <span class="sp">{{ d.specialty_en or d.specialty_bn }}</span>
+          {% endif %}
+        </span>
+        <span class="doc-actions">
+          {% if d.active %}
+          <span class="badge on">● Active</span>
+          {% else %}
+          <span class="badge pill-off">○ Disabled</span>
+          {% endif %}
+          <a class="btn sm ghost" href="/admin/doctors/{{ d.id }}">✏️ Edit</a>
+          <form class="inline" method="POST" action="/admin/doctors/{{ d.id }}/toggle">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+            <button class="btn sm ghost" type="submit">
+              {{ 'Disable' if d.active else 'Enable' }}</button>
+          </form>
+          <form class="inline" method="POST" action="/admin/doctors/{{ d.id }}/delete"
+                onsubmit="return confirm('Delete this doctor permanently? This only works when they have no appointments at all.')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+            <button class="btn sm danger" type="submit">🗑 Delete</button>
+          </form>
+        </span>
+      </div>
+      <div class="doc-meta">
+        <div class="m"><div class="k">Weekly hours</div>
+          <div class="v">{{ row.summary }}</div></div>
+        <div class="m"><div class="k">Slot length</div>
+          <div class="v">{{ d.slot_minutes }} minutes</div></div>
+        <div class="m"><div class="k">Upcoming appointments</div>
+          <div class="v">{{ row.upcoming }}</div></div>
+        <div class="m"><div class="k">Days off</div>
+          <div class="v">
+            {% set offs = time_off_by_doctor.get(d.id, []) %}
+            {% if offs %}
+              {{ offs | length }} upcoming range{{ 's' if offs | length != 1 }}
+            {% else %}None{% endif %}
+          </div></div>
+      </div>
+    </div>
+    {% endfor %}
+  {% else %}
+  <div class="empty">
+    <div class="ic">🩺</div>
+    <p>No doctors yet.</p>
+    <a class="btn" href="/admin/doctors/new">+ Add the first doctor</a>
+  </div>
+  {% endif %}
+{% endblock %}

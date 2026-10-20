@@ -35,6 +35,13 @@ Environment variables take priority over `config.json`. The panel never writes
 admin credentials are stored as hashes in SQLite. `config.json` remains only as
 a legacy fallback for the API key (see *Admin panel → Settings*).
 
+> ⚠️ **The API key saved through the Settings page is stored in plain text in
+> `clinic.db`** (the `settings` table). It is never rendered back into a page,
+> but anyone with the file has the key. For anything beyond a demo, set
+> `OPENROUTER_API_KEY` in the environment instead and leave the panel field
+> empty — that value is preferred automatically. **`clinic.db` must never be
+> shared, emailed, or committed**; treat it like a password file.
+
 > ⚠️ `config.json`, `appointments.json`, `clinic.db`, `venv/`, `__pycache__/`,
 > `*.pyc`, and `.env` are gitignored. Never commit real secrets.
 
@@ -59,6 +66,8 @@ at request time by `prompt_builder.py` — nothing about the clinic is hardcoded
 ## URLs
 - Website   : http://localhost:5000
 - Admin     : http://localhost:5000/admin  (owner accounts only)
+- Doctors   : http://localhost:5000/admin/doctors
+- Services  : http://localhost:5000/admin/services
 - Settings  : http://localhost:5000/admin/settings
 - Account   : http://localhost:5000/admin/account
 - Agent     : http://localhost:5000/agent/login  (agent/owner accounts)
@@ -67,11 +76,11 @@ at request time by `prompt_builder.py` — nothing about the clinic is hardcoded
 ## Admin panel
 
 All owner pages share one responsive layout (`templates/admin_base.html`): a
-dark sidebar with Appointments / Settings / Account plus links to the Agent
-Console and Logout, a top bar showing who is signed in, and flash messages
-rendered at the top of the content area. It is a single `{% block content %}`
-per page — adding a page means one new template that extends the base and one
-`nav="…"` value.
+dark sidebar with Appointments / Doctors / Services / Settings / Account plus
+links to the Agent Console and Logout, a top bar showing who is signed in, and
+flash messages rendered at the top of the content area. It is a single
+`{% block content %}` per page — adding a page means one new template that
+extends the base and one `nav="…"` value.
 
 **Security on every `/admin` route**
 
@@ -86,10 +95,13 @@ per page — adding a page means one new template that extends the base and one
   when `COOKIE_SECURE=1` (set it behind HTTPS). Logging in clears the incoming
   session and mints a fresh CSRF token (session-fixation defence). Admin
   sessions idle out after `SESSION_IDLE_HOURS` (default 8, configurable).
-- **Login throttle.** Five failed attempts per IP *or* per username within ten
-  minutes blocks that key for five minutes with one generic message
-  ("Too many failed attempts…"). Attempts are logged through the `logging`
-  module as `clinic.admin` warnings — usernames and IPs only, never passwords.
+- **Login throttle.** Five failed attempts for the same **(IP, username) pair**
+  within ten minutes blocks that pair for five minutes, and a separate looser
+  cap of twenty failures per IP (across every username) protects against one
+  address spraying many names. A block always shows the same generic message
+  ("Too many failed attempts…"), and a username attacked from one address can
+  still sign in from another. Attempts are logged through the `logging` module
+  as `clinic.admin` warnings — usernames and IPs only, never passwords.
 - **Open redirect.** The `next` parameter after login is only honoured when it
   is a same-site relative path (`/admin/...`); absolute URLs, `//host`,
   backslashes and control characters fall back to `/admin`.
@@ -133,7 +145,58 @@ Grouped sections, all saved with one token-guarded POST:
   `build_system_prompt(lang)` produces right now, escaped in a scrollable `<pre>`.
 
 Settings are read from SQLite on every request, so changes reach the chatbot
-immediately — no restart.
+immediately — no restart. The **Doctors** and **Services** pages link back to
+this preview ("View what the bot sees").
+
+**Doctors — `/admin/doctors`**
+
+
+Each doctor card lists the EN/BN name, specialty, an active badge, slot length,
+a compact weekly-hours summary, upcoming appointments, and how many days off are
+scheduled. Actions are Edit, Enable/Disable and Delete.
+
+- **Add/Edit** — name EN/BN (at least one required, max 100), specialty EN/BN
+  (max 120), bio EN/BN (max 600), `slot_minutes` (10–120, multiple of 5), and an
+  active toggle. An active doctor must have at least one weekly range.
+- **Weekly schedule editor** — one row per weekday (Mon–Sun) with small vanilla
+  JS **Add range** / **Remove** buttons. The server checks `HH:MM` formatting,
+  `start < end`, no overlap within a weekday, and that each range fits at least
+  one slot. Saving replaces the schedule **atomically** — a rejected save leaves
+  the previous schedule untouched.
+- **Impact warning** — if a save would change the schedule, slot length or
+  active flag in a way that affects **upcoming, non-cancelled** appointments
+  (time no longer inside the schedule or off a slot boundary, or the doctor is
+  being disabled), nothing is applied. A confirmation page lists the affected
+  appointments (patient, phone, date, time, reason); the owner either confirms
+  (appointments stay exactly as they are) or goes back. **Nothing is ever
+  auto-cancelled.**
+- **Delete** — only allowed when the doctor has **no appointments at all**;
+  otherwise it is blocked with a message suggesting **Disable**. Disabled doctors
+  keep their history everywhere but vanish from the chatbot prompt and from slot
+  generation.
+
+**Doctor days off**
+
+On each doctor's edit page you can list upcoming time off, add a range (each
+range: `date_from <= date_to`, not in the past, at most 90 days long, reason
+optional max 200), and remove a range. Adding a range that overlaps an upcoming
+appointment shows the same confirmation page. Days off:
+
+- remove those dates from `get_available_slots()` and `get_next_available_slots()`,
+- stop the availability section of the prompt from offering them,
+- make the booking validator reject them with a clear reason ("the doctor is on
+  leave") so the bot can offer alternatives,
+- and appear in a short "Upcoming days off (next 30 days)" line in the prompt
+  (e.g. *"Dr. X is on leave 25 Oct–27 Oct"*) so the bot can explain why.
+
+**Services — `/admin/services`**
+
+Each service card shows the EN/BN name, the price range via `format_price`, the
+duration, an active badge, and how many appointments use it. Actions are Edit,
+Enable/Disable and Delete. Validation: at least one name (max 100), `price >= 0`,
+`price_max` empty or `>= price`, duration 5–480 (multiple of 5), and sane numeric
+bounds. Delete is blocked while any appointment references the service (use
+Disable); disabled services disappear from the prompt.
 
 ## Human handoff (agents)
 
@@ -229,25 +292,46 @@ Optional extras to show: the **unread dot** on *My chats*, the sound toggle
 browser-tab title, and the responsive layout (narrow the window: the list and
 the chat become separate views with a back button).
 
+### Demo: doctors, days off and immediate effect
+
+1. **Disable Dr. Karim.** In `/admin/doctors`, click **Disable** next to
+   *Dr. Karim*. Ask the chatbot to book him — it must **refuse** and offer
+   *Dr. Rahela Khanam* instead. Then click **Enable** to bring him back.
+2. **Add a day off for Dr. Rahela.** Open her edit page, add a days-off range
+   covering one of her working days, and ask the chatbot for that day — it must
+   explain she is **on leave** and offer other days.
+3. **Nothing needs a restart.** Every one of these changes is read from SQLite
+   on the next message; use *View what the bot sees* on the doctors/services
+   page to read the exact prompt the bot is using.
+
 ## Tests
 ```bash
-python test_booking.py    # 30 checks — booking pipeline
-python test_handoff.py    # 90 checks — sessions, state machine, agent API, widget API
-python test_admin.py      # 16 checks — admin panel security (unittest)
+python test_booking.py        # 30 checks — booking pipeline
+python test_handoff.py        # 90 checks — sessions, state machine, agent API, widget API
+python test_admin.py          # 18 checks — admin panel security (unittest)
+python test_admin_catalog.py  # 22 checks — doctors, days off, services (unittest)
 ```
-All three run against a throwaway database with a mocked AI (no network):
+All four run against a throwaway database with a mocked AI (no network):
 
 - **booking** — normal booking, taken slot, invalid phone, non-working day,
   past date, malformed marker, atomic double-booking, reset, rate limit;
 - **handoff** — handoff state transitions, agent races, permissions/CSRF,
   timeouts, session isolation, callbacks, canned replies, console page;
 - **admin panel** — CSRF on every admin POST, agent accounts locked out with a
-  403, login throttling (per-IP and per-username) with password-free logging,
-  the forced first-login password change, open-redirect protection on `next`,
-  session cookie flags (`HttpOnly` / `SameSite=Lax` / `Secure` under
-  `COOKIE_SECURE=1`), session regeneration on login, POST-only logout and
-  delete, API-key non-exposure in HTML/JSON/prompt, password policy, settings
-  validation, and the removal of `/admin/config`.
+  403, login throttling keyed on the **(IP, username) pair** plus the per-IP cap
+  with password-free logging, the forced first-login password change,
+  open-redirect protection on `next`, session cookie flags (`HttpOnly` /
+  `SameSite=Lax` / `Secure` under `COOKIE_SECURE=1`), session regeneration on
+  login, POST-only logout and delete, API-key non-exposure in HTML/JSON/prompt,
+  password policy, settings validation, and the removal of `/admin/config`;
+- **admin catalog** — CSRF on every new POST, agent 403 wall, doctor/services
+  field validation, inverted/overlapping/too-short schedule ranges, **atomic**
+  schedule saves (a rejected save keeps the old schedule), the impact-warning
+  flow (nothing changes until confirmed), disabling a doctor removing them from
+  the prompt and from slot generation, days off removing dates from slots and
+  making the booking validator explain why, delete blocked while appointments
+  exist, time-off and price/duration validation, and multi-range slot
+  generation.
 
 ## File structure
 ```
@@ -259,6 +343,7 @@ dental_v4/
 ├── test_booking.py     ← Booking pipeline tests (mocked AI, temp DB)
 ├── test_handoff.py     ← Human-handoff tests (mocked AI, temp DB)
 ├── test_admin.py       ← Admin panel security tests (unittest, temp DB)
+├── test_admin_catalog.py ← Doctors/services/days-off tests (unittest, temp DB)
 ├── manual_test_widget.md ← Hands-on script for the browser widget
 ├── clinic.db           ← SQLite database (gitignored, auto-created)
 ├── config.example.json ← Template for config.json (safe to commit)
@@ -269,6 +354,11 @@ dental_v4/
     ├── admin_base.html     ← Shared admin shell (sidebar, topbar, flash)
     ├── admin_login.html    ← Admin (owner) login
     ├── admin.html          ← Appointments table
+    ├── admin_doctors.html  ← Doctors list (schedule summary, badges)
+    ├── admin_doctor_edit.html ← Doctor form, schedule editor, days off
+    ├── admin_services.html ← Services list (price, duration, badges)
+    ├── admin_service_edit.html ← Service form
+    ├── admin_confirm_impact.html ← Warning page for affected appointments
     ├── admin_settings.html ← Settings (clinic info, AI, key, timings, preview)
     ├── admin_account.html  ← Account (profile + password change)
     ├── agent_login.html    ← Agent login
@@ -313,4 +403,16 @@ Admin (owner login + hidden `csrf_token` form field required on every POST):
 | GET/POST | `/admin/settings` | Clinic info, AI model, API key, handoff timings |
 | POST | `/admin/settings/test_ai` | Tiny request to OpenRouter; reports ok/error, never the key |
 | GET/POST | `/admin/account` | Display name, username, password change |
+| GET  | `/admin/doctors` | Doctors list (schedule summary, upcoming counts, days off) |
+| GET/POST | `/admin/doctors/new` | Create a doctor (+ weekly schedule) |
+| GET/POST | `/admin/doctors/<id>` | Edit a doctor, schedule, and add days off |
+| POST | `/admin/doctors/<id>/toggle` | Enable/disable (impact-confirmed if it affects bookings) |
+| POST | `/admin/doctors/<id>/delete` | Delete (blocked while appointments exist) |
+| POST | `/admin/doctors/<id>/time-off/<tid>/delete` | Remove a days-off range |
+| GET  | `/admin/services` | Services list (price, duration, usage) |
+| GET/POST | `/admin/services/new` | Create a service |
+| GET/POST | `/admin/services/<id>` | Edit a service |
+| POST | `/admin/services/<id>/toggle` | Enable/disable |
+| POST | `/admin/services/<id>/delete` | Delete (blocked while appointments use it) |
+| POST | `/admin/confirm-impact` | Apply a doctor/schedule/days-off change the owner confirmed |
 

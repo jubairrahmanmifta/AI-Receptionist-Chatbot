@@ -1,0 +1,75 @@
+{% extends "admin_base.html" %}
+{% block title %}Confirm change{% endblock %}
+{% block heading %}Confirm change{% endblock %}
+{% block style %}
+  .warn-box { background:#fffbeb; border:1px solid #fde68a; color:#92400e;
+              border-radius:12px; padding:16px 18px; margin-bottom:20px;
+              font-size:13.5px; line-height:1.6; }
+  .warn-box b { display:block; margin-bottom:4px; font-size:14px; }
+  .appt-table { width:100%; border-collapse:collapse; }
+  .appt-table th { background:#f9fafb; padding:10px 14px; text-align:left;
+                   font-size:11px; font-weight:700; color:var(--muted);
+                   text-transform:uppercase; letter-spacing:.5px;
+                   border-bottom:1px solid var(--line); }
+  .appt-table td { padding:12px 14px; font-size:13.5px;
+                   border-bottom:1px solid #f3f4f6;
+                   font-family:'Hind Siliguri','Inter',sans-serif; }
+  .appt-table tr:last-child td { border-bottom:none; }
+  .reason-chip { display:inline-block; background:#fef2f2; color:#b91c1c;
+                 border-radius:6px; padding:2px 9px; font-size:11.5px;
+                 font-weight:600; margin:2px 4px 2px 0; }
+  .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:20px; }
+  .notes { font-size:12.5px; color:var(--muted); line-height:1.6;
+           margin-top:14px; }
+  .table-wrap { overflow-x:auto; }
+{% endblock %}
+{% block content %}
+  <div class="warn-box">
+    <b>⚠️ This change affects upcoming appointments</b>
+    {{ summary }} Nothing has been changed yet.
+  </div>
+
+  <div class="card">
+    <h2>Affected appointments</h2>
+    <p class="hint">These {{ affected | length }} appointment{{ 's' if affected | length != 1 }}
+      will stay exactly as they are — nothing is cancelled or moved. They are
+      shown here so you can call the patients yourself if needed.</p>
+    <div class="table-wrap">
+      <table class="appt-table">
+        <thead>
+          <tr><th>Patient</th><th>Phone</th><th>Date</th><th>Time</th>
+            <th>Why affected</th></tr>
+        </thead>
+        <tbody>
+        {% for a in affected %}
+          <tr>
+            <td>{{ a.patient_name or '—' }}</td>
+            <td>{{ a.phone or '—' }}</td>
+            <td>{{ a.date or '—' }}</td>
+            <td>{{ a.time or '—' }}</td>
+            <td>
+              {% for reason in a.reasons %}
+              <span class="reason-chip">{{ reason }}</span>
+              {% endfor %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="notes">
+      The doctor's page and the appointments list will flag these rows so they
+      are easy to find later. If a patient needs rescheduling, edit the
+      appointment from the Appointments page or call them.
+    </p>
+  </div>
+
+  <form method="POST" action="/admin/confirm-impact">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+    <input type="hidden" name="impact_token" value="{{ token }}"/>
+    <div class="actions">
+      <button class="btn danger" type="submit">Yes, apply the change</button>
+      <a class="btn ghost" href="{{ back_url }}">← Go back without changing</a>
+    </div>
+  </form>
+{% endblock %}

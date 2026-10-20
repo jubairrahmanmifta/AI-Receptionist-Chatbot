@@ -48,14 +48,19 @@ def csrf_of(client):
         return sess.get("csrf_token", "")
 
 
-def admin_login(client, username, password, next_url=None):
-    """Open the login form (which mints the CSRF token), then POST credentials."""
-    client.get("/admin/login")
+def admin_login(client, username, password, next_url=None,
+                environ_overrides=None):
+    """Open the login form (which mints the CSRF token), then POST credentials.
+
+    ``environ_overrides`` lets a test pretend to come from another IP address.
+    """
+    env = environ_overrides or {}
+    client.get("/admin/login", environ_overrides=env)
     data = {"username": username, "password": password,
             "csrf_token": csrf_of(client)}
     if next_url is not None:
         data["next"] = next_url
-    return client.post("/admin/login", data=data)
+    return client.post("/admin/login", data=data, environ_overrides=env)
 
 
 def location_parts(response):
@@ -197,16 +202,46 @@ class AdminPanelTests(unittest.TestCase):
         self.assertNotIn("Invalid username", body)   # generic message only
         self.assertNotIn(OWNER[1], body)
 
-        # Keyed by IP too, so a brand-new client from here is blocked as well.
+        # The block is per (IP, username) pair, so the same address is refused.
         response = admin_login(new_client(), OWNER[0], OWNER[1])
         self.assertIn("Too many failed attempts", response.get_data(as_text=True))
 
-        # Once the 5-minute block elapses the key is released again.
+        # Once the 5-minute block elapses the pair is released again.
         now = time.time()
         for key in list(app_mod._login_blocks):
             app_mod._login_blocks[key] = now - 1
         response = admin_login(new_client(), OWNER[0], OWNER[1])
         self.assertIn(response.status_code, (301, 302))
+
+    def test_throttle_pair_does_not_lock_username_from_other_ip(self):
+        """A username attacked from one address still works from another."""
+        attacker = new_client()
+        for attempt in range(5):
+            admin_login(attacker, OWNER[0], "bad-%d" % attempt,
+                        environ_overrides={"REMOTE_ADDR": "10.0.0.9"})
+
+        # The attacking IP is now blocked for that username...
+        blocked = admin_login(new_client(), OWNER[0], OWNER[1],
+                              environ_overrides={"REMOTE_ADDR": "10.0.0.9"})
+        self.assertIn("Too many failed attempts",
+                      blocked.get_data(as_text=True))
+
+        # ...but the same username from a different IP is untouched.
+        allowed = admin_login(new_client(), OWNER[0], OWNER[1],
+                              environ_overrides={"REMOTE_ADDR": "10.0.0.10"})
+        self.assertIn(allowed.status_code, (301, 302))
+
+    def test_throttle_per_ip_cap_blocks_many_usernames(self):
+        """A single address spraying many usernames trips the looser per-IP cap."""
+        attacker = new_client()
+        env = {"REMOTE_ADDR": "10.0.0.20"}
+        for index in range(app_mod.LOGIN_IP_FAIL_LIMIT):
+            admin_login(attacker, "spray_%d" % index, "bad",
+                        environ_overrides=env)
+        blocked = admin_login(attacker, "spray_final", "bad",
+                              environ_overrides=env)
+        self.assertIn("Too many failed attempts",
+                      blocked.get_data(as_text=True))
 
     # ── 4. forced password change ────────────────────────────────────────────
     def test_must_change_password_redirects_and_is_cleared(self):

@@ -125,6 +125,18 @@ CREATE TABLE IF NOT EXISTS doctor_schedule (
     end_time   TEXT NOT NULL              -- 'HH:MM'
 );
 
+CREATE TABLE IF NOT EXISTS doctor_time_off (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    doctor_id  INTEGER NOT NULL REFERENCES doctors(id) ON DELETE CASCADE,
+    date_from  TEXT NOT NULL,             -- 'YYYY-MM-DD' (inclusive)
+    date_to    TEXT NOT NULL,             -- 'YYYY-MM-DD' (inclusive)
+    reason     TEXT,
+    created_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_doctor_time_off_doctor
+    ON doctor_time_off(doctor_id);
+
 CREATE TABLE IF NOT EXISTS services (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     name_en          TEXT,
@@ -371,6 +383,23 @@ def _migrate_columns():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation "
             "ON chat_messages(conversation_id)"
+        )
+
+        # Doctor days off (Prompt 4B). New databases get these from SCHEMA; this
+        # keeps databases created earlier in step, and is safe to re-run.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS doctor_time_off (
+                   id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                   doctor_id  INTEGER NOT NULL REFERENCES doctors(id) ON DELETE CASCADE,
+                   date_from  TEXT NOT NULL,
+                   date_to    TEXT NOT NULL,
+                   reason     TEXT,
+                   created_at TEXT
+               )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doctor_time_off_doctor "
+            "ON doctor_time_off(doctor_id)"
         )
 
         # Track the last time the customer's widget reached the server, so a
@@ -777,14 +806,19 @@ def get_available_slots(doctor_id, date):
     Slots come from the doctor's weekly schedule, generated every
     ``slot_minutes``. Slots already booked (any status except ``cancelled``)
     are removed, and when ``date`` is today, slots already in the past are
-    removed too.
+    removed too. A disabled doctor, or a date inside one of the doctor's
+    days-off ranges, has no slots at all.
     """
     doctor = get_doctor(doctor_id)
     if not doctor:
         return []
+    if not doctor.get("active"):
+        return []
     try:
         day = datetime.date.fromisoformat(date)
     except (ValueError, TypeError):
+        return []
+    if is_doctor_off(doctor_id, date):
         return []
 
     slot_minutes = doctor.get("slot_minutes") or 30
@@ -943,6 +977,220 @@ def delete_doctor(doctor_id):
     with _connect() as conn:
         cur = conn.execute("DELETE FROM doctors WHERE id = ?", (doctor_id,))
         return cur.rowcount > 0
+
+
+# ─── DOCTOR DAYS OFF ─────────────────────────────────────────────────────────
+
+def list_doctor_time_off(doctor_id, upcoming_only=False, from_date=None):
+    """Return a doctor's time-off ranges, soonest first.
+
+    ``upcoming_only`` keeps ranges whose ``date_to`` is on/after today
+    (Asia/Dhaka). ``from_date`` overrides "today" for the filter.
+    """
+    query = "SELECT * FROM doctor_time_off WHERE doctor_id = ?"
+    params = [doctor_id]
+    if upcoming_only:
+        query += " AND date_to >= ?"
+        params.append(from_date or dhaka_today().isoformat())
+    query += " ORDER BY date_from, date_to, id"
+    with _connect() as conn:
+        return _rows_to_dicts(conn.execute(query, params).fetchall())
+
+
+def is_doctor_off(doctor_id, date):
+    """True when ``date`` ('YYYY-MM-DD') falls inside one of the doctor's ranges."""
+    if not date:
+        return False
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM doctor_time_off
+               WHERE doctor_id = ? AND date_from <= ? AND date_to >= ?
+               LIMIT 1""",
+            (doctor_id, str(date), str(date)),
+        ).fetchone()
+    return row is not None
+
+
+def time_off_reason(doctor_id, date):
+    """Return the reason for the range covering ``date``, else ``None``."""
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT reason FROM doctor_time_off
+               WHERE doctor_id = ? AND date_from <= ? AND date_to >= ?
+               ORDER BY date_from LIMIT 1""",
+            (doctor_id, str(date), str(date)),
+        ).fetchone()
+    return row["reason"] if row else None
+
+
+def list_time_off_days(days=30, from_date=None):
+    """Return upcoming time-off ranges within ``days``, grouped per doctor.
+
+    Result: ``[{doctor_id, doctor_name_en, doctor_name_bn, date_from, date_to,
+    reason}, ...]`` for use in the system prompt.
+    """
+    start = from_date or dhaka_today().isoformat()
+    end = ((from_date and datetime.date.fromisoformat(from_date))
+           or dhaka_today()) + datetime.timedelta(days=days)
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT t.*, d.name_en, d.name_bn
+               FROM doctor_time_off t
+               JOIN doctors d ON d.id = t.doctor_id
+               WHERE t.date_to >= ? AND t.date_from <= ?
+                 AND d.active = 1
+               ORDER BY t.date_from, t.id""",
+            (start, end.isoformat()),
+        ).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["doctor_name_en"] = item.pop("name_en")
+        item["doctor_name_bn"] = item.pop("name_bn")
+        out.append(item)
+    return out
+
+
+def create_time_off(doctor_id, date_from, date_to, reason=None):
+    """Add a days-off range. Returns the new id."""
+    with _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO doctor_time_off
+               (doctor_id, date_from, date_to, reason, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (doctor_id, date_from, date_to, reason, _now()),
+        )
+    return cur.lastrowid
+
+
+def delete_time_off(time_off_id):
+    """Remove a days-off range. Returns True when a row was deleted."""
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM doctor_time_off WHERE id = ?",
+                           (time_off_id,))
+        return cur.rowcount > 0
+
+
+def get_time_off(time_off_id):
+    """Return one days-off range as a dict or ``None``."""
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM doctor_time_off WHERE id = ?",
+                           (time_off_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# ─── CATALOG HELPERS (admin panel) ───────────────────────────────────────────
+
+def count_appointments_for_doctor(doctor_id, upcoming_only=False, from_date=None):
+    """Number of non-cancelled appointments for a doctor."""
+    query = ("SELECT COUNT(*) AS n FROM appointments "
+             "WHERE doctor_id = ? AND status != 'cancelled'")
+    params = [doctor_id]
+    if upcoming_only:
+        query += " AND date >= ?"
+        params.append(from_date or dhaka_today().isoformat())
+    with _connect() as conn:
+        return conn.execute(query, params).fetchone()["n"]
+
+
+def count_appointments_for_service(service_id):
+    """Number of non-cancelled appointments using a service."""
+    with _connect() as conn:
+        return conn.execute(
+            """SELECT COUNT(*) AS n FROM appointments
+               WHERE service_id = ? AND status != 'cancelled'""",
+            (service_id,),
+        ).fetchone()["n"]
+
+
+def count_all_appointments_for_doctor(doctor_id):
+    """Every appointment row for a doctor, cancelled ones included.
+
+    Used to decide whether a doctor may be deleted: a doctor that was ever
+    booked is kept so the history still makes sense.
+    """
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM appointments WHERE doctor_id = ?",
+            (doctor_id,),
+        ).fetchone()["n"]
+
+
+def count_all_appointments_for_service(service_id):
+    """Every appointment row for a service, cancelled ones included."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM appointments WHERE service_id = ?",
+            (service_id,),
+        ).fetchone()["n"]
+
+
+def list_upcoming_appointments(doctor_id=None, service_id=None, from_date=None):
+    """Non-cancelled appointments today or later, soonest first."""
+    query = ("SELECT * FROM appointments WHERE status != 'cancelled' "
+             "AND date >= ?")
+    params = [from_date or dhaka_today().isoformat()]
+    if doctor_id is not None:
+        query += " AND doctor_id = ?"
+        params.append(doctor_id)
+    if service_id is not None:
+        query += " AND service_id = ?"
+        params.append(service_id)
+    query += " ORDER BY date, time, id"
+    with _connect() as conn:
+        return _rows_to_dicts(conn.execute(query, params).fetchall())
+
+
+def set_schedule_atomic(doctor_id, schedule):
+    """Replace a doctor's weekly schedule in one transaction.
+
+    Either every new range is written or none are: a failure rolls back to the
+    previous schedule. Returns the doctor after the swap.
+    """
+    slots = list(schedule or [])
+    with _connect_tx() as conn:
+        conn.execute("DELETE FROM doctor_schedule WHERE doctor_id = ?",
+                     (doctor_id,))
+        for slot in slots:
+            conn.execute(
+                """INSERT INTO doctor_schedule
+                   (doctor_id, weekday, start_time, end_time)
+                   VALUES (?, ?, ?, ?)""",
+                (doctor_id, slot["weekday"], slot["start_time"],
+                 slot["end_time"]),
+            )
+    return get_doctor(doctor_id)
+
+
+def save_doctor_with_schedule(doctor_id, schedule=None, **fields):
+    """Update a doctor's fields and (optionally) schedule in ONE transaction.
+
+    Used by the admin panel so a bad schedule can never half-apply: the field
+    update and the schedule swap commit together or not at all.
+    """
+    allowed = {"name_en", "name_bn", "specialty_en", "specialty_bn",
+               "bio_en", "bio_bn", "slot_minutes", "active"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    slots = None if schedule is None else list(schedule)
+    with _connect_tx() as conn:
+        if updates:
+            assignments = ", ".join("%s = ?" % k for k in updates)
+            conn.execute(
+                "UPDATE doctors SET %s WHERE id = ?" % assignments,
+                (*updates.values(), doctor_id),
+            )
+        if slots is not None:
+            conn.execute("DELETE FROM doctor_schedule WHERE doctor_id = ?",
+                         (doctor_id,))
+            for slot in slots:
+                conn.execute(
+                    """INSERT INTO doctor_schedule
+                       (doctor_id, weekday, start_time, end_time)
+                       VALUES (?, ?, ?, ?)""",
+                    (doctor_id, slot["weekday"], slot["start_time"],
+                     slot["end_time"]),
+                )
+    return get_doctor(doctor_id)
 
 
 # ─── SERVICES ─────────────────────────────────────────────────────────────────
