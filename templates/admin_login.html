@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="csrf-token" content="{{ csrf_token }}"/>
   <title>Admin Login — Smile Dental Care</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
   <style>
@@ -19,6 +20,12 @@
     .btn { width: 100%; padding: 13px; background: #1a56db; color: #fff; border: none; border-radius: 9px; font-size: 15px; font-weight: 700; cursor: pointer; font-family: inherit; transition: background .2s; }
     .btn:hover { background: #1240a8; }
     .error { background: #fef2f2; border: 1px solid #fecaca; color: #dc2626; border-radius: 8px; padding: 11px 14px; font-size: 13px; margin-bottom: 18px; text-align: center; }
+    .flash { padding: 11px 14px; border-radius: 8px; font-size: 13px; line-height: 1.5; margin-bottom: 18px; border: 1px solid; }
+    .flash.success { background: #f0fdf4; border-color: #bbf7d0; color: #166534; }
+    .flash.error   { background: #fef2f2; border-color: #fecaca; color: #b91c1c; }
+    .flash.notice  { background: #fffbeb; border-color: #fde68a; color: #92400e; }
+    .foot { margin-top: 18px; font-size: 12.5px; color: #9ca3af; text-align: center; }
+    .foot a { color: #1a56db; text-decoration: none; }
   </style>
 </head>
 <body>
@@ -28,14 +35,26 @@
       <h1>Admin Panel</h1>
       <p>Smile Dental Care</p>
     </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+      <div class="flash {{ 'error' if category == 'error' else category }}">{{ message }}</div>
+      {% endfor %}
+    {% endwith %}
+
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
-    <form method="POST">
+
+    <form method="POST" action="/admin/login">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+      {% if next_value %}<input type="hidden" name="next" value="{{ next_value }}"/>{% endif %}
       <label>Username</label>
       <input type="text" name="username" placeholder="Enter username" required autocomplete="off"/>
       <label>Password</label>
-      <input type="password" name="password" placeholder="Enter password" required/>
+      <input type="password" name="password" placeholder="Enter password" required autocomplete="current-password"/>
       <button class="btn" type="submit">Login →</button>
     </form>
+
+    <p class="foot">Agents, sign in at <a href="/agent/login">the agent console</a>.</p>
   </div>
 </body>
 </html>

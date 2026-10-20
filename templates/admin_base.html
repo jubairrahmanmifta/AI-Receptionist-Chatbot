@@ -1,0 +1,196 @@
+{#- Shared admin shell: dark sidebar + topbar, consistent flash messages.
+
+    Pages override:
+      title    — browser tab text
+      heading  — text shown in the top bar
+      style    — page-specific <style> (still inline, no external files)
+      content  — the page body
+      page_js  — page-specific <script>
+
+    Pass ``nav`` from the view to highlight the current sidebar item
+    ("appointments" | "settings" | "account"). New nav items only need a
+    line below — keep them grouped under NAV so future pages (doctors,
+    services, agents, canned replies) slot straight in.
+-#}
+{% set nav = nav|default('') %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="csrf-token" content="{{ csrf_token }}"/>
+  <title>{% block title %}Admin{% endblock %} — Smile Dental Care</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Hind+Siliguri:wght@400;500;600&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --ink:#1a1f36; --brand:#1a56db; --brand-dark:#1240a8;
+      --muted:#6b7280; --line:#e5e7eb; --bg:#f0f4ff; --danger:#dc2626;
+    }
+    body { font-family:'Inter',system-ui,-apple-system,sans-serif; background:var(--bg);
+           color:var(--ink); min-height:100vh; }
+    .shell { display:flex; min-height:100vh; align-items:stretch; }
+
+    /* ── Sidebar ─────────────────────────────────────────────── */
+    .sidebar { width:234px; flex-shrink:0; background:var(--ink); color:#c7cbd4;
+               display:flex; flex-direction:column; position:sticky; top:0;
+               height:100vh; }
+    .brand { display:flex; align-items:center; gap:10px; padding:18px 18px 16px;
+             color:#fff; text-decoration:none; }
+    .brand .ic { font-size:22px; }
+    .brand b { font-size:14px; font-weight:700; display:block; line-height:1.2; }
+    .brand small { font-size:11px; color:#9ca3af; }
+    .nav { display:flex; flex-direction:column; gap:2px; padding:4px 10px; flex:1;
+           overflow-y:auto; }
+    .nav-item { display:flex; align-items:center; gap:9px; padding:10px 12px;
+                border-radius:8px; font-size:13.5px; font-weight:500; color:#c7cbd4;
+                text-decoration:none; border:none; background:none; cursor:pointer;
+                font-family:inherit; text-align:left; width:100%; transition:background .15s, color .15s; }
+    .nav-item:hover { background:rgba(255,255,255,.07); color:#fff; }
+    .nav-item.active { background:rgba(26,86,219,.38); color:#fff;
+                       box-shadow:inset 3px 0 0 var(--brand); }
+    .nav-label { font-size:10.5px; letter-spacing:.8px; text-transform:uppercase;
+                 color:#6b7280; padding:14px 12px 4px; }
+    .side-foot { padding:10px; border-top:1px solid #2a3047; display:flex;
+                 flex-direction:column; gap:6px; }
+
+    /* ── Topbar + content ────────────────────────────────────── */
+    .main { flex:1; min-width:0; display:flex; flex-direction:column; }
+    .topbar { background:#fff; border-bottom:1px solid var(--line); padding:14px 26px;
+              display:flex; align-items:center; gap:12px; }
+    .topbar h1 { font-size:16px; font-weight:700; }
+    .topbar .sub { font-size:12px; color:var(--muted); }
+    .topbar .who { margin-left:auto; font-size:13px; color:var(--muted);
+                   display:flex; align-items:center; gap:7px; }
+    .topbar .who .av { width:26px; height:26px; border-radius:50%; background:#eef2ff;
+                       color:var(--brand); display:grid; place-items:center;
+                       font-size:12px; font-weight:700; }
+    .content { padding:26px; width:100%; max-width:1180px; margin:0 auto; }
+
+    /* ── Flash messages ──────────────────────────────────────── */
+    .flash { padding:12px 16px; border-radius:10px; font-size:13.5px; line-height:1.5;
+             margin-bottom:18px; border:1px solid; display:flex; gap:10px;
+             align-items:flex-start; }
+    .flash .x { margin-left:auto; background:none; border:none; cursor:pointer;
+                font-size:16px; line-height:1; color:inherit; opacity:.55; }
+    .flash .x:hover { opacity:1; }
+    .flash.success { background:#f0fdf4; border-color:#bbf7d0; color:#166534; }
+    .flash.error   { background:#fef2f2; border-color:#fecaca; color:#b91c1c; }
+    .flash.notice  { background:#fffbeb; border-color:#fde68a; color:#92400e; }
+
+    /* ── Cards, forms, buttons ───────────────────────────────── */
+    .card { background:#fff; border:1px solid var(--line); border-radius:14px;
+            padding:22px; margin-bottom:20px; }
+    .card > h2 { font-size:14px; font-weight:700; margin-bottom:4px; }
+    .card > .hint { font-size:12.5px; color:var(--muted); line-height:1.55;
+                    margin-bottom:16px; }
+    .card h3 { font-size:12.5px; font-weight:700; color:#374151; margin:6px 0 12px;
+               text-transform:uppercase; letter-spacing:.5px; }
+    .sect + .sect { border-top:1px solid var(--line); margin-top:22px; padding-top:20px; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+    .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+    .field { margin-bottom:16px; }
+    .field:last-child { margin-bottom:0; }
+    label.f { display:block; font-size:12.5px; font-weight:600; color:#374151;
+              margin-bottom:6px; }
+    label.f .opt { color:var(--muted); font-weight:500; }
+    .inp { width:100%; padding:10px 12px; border:1.5px solid var(--line);
+           border-radius:9px; font-size:14px; font-family:inherit; background:#fff;
+           outline:none; transition:border-color .15s; }
+    .inp:focus { border-color:var(--brand); }
+    textarea.inp { min-height:96px; resize:vertical; line-height:1.55; }
+    .help { font-size:12px; color:var(--muted); margin-top:6px; line-height:1.5; }
+    .err-list { background:#fef2f2; border:1px solid #fecaca; color:#b91c1c;
+                border-radius:10px; padding:12px 16px; font-size:13px; margin-bottom:18px;
+                line-height:1.7; }
+    .err-list ul { margin-left:18px; }
+    .btn { display:inline-flex; align-items:center; gap:7px; padding:10px 20px;
+           border:none; border-radius:9px; background:var(--brand); color:#fff;
+           font-size:13.5px; font-weight:600; cursor:pointer; font-family:inherit;
+           transition:background .15s; }
+    .btn:hover { background:var(--brand-dark); }
+    .btn.ghost { background:#fff; color:#374151; border:1px solid var(--line); }
+    .btn.ghost:hover { background:#f9fafb; border-color:#d1d5db; }
+    .btn.danger { background:var(--danger); }
+    .btn.danger:hover { background:#b91c1c; }
+    .btn.sm { padding:6px 13px; font-size:12.5px; }
+    .btn:disabled { opacity:.6; cursor:not-allowed; }
+    .badge { display:inline-flex; align-items:center; gap:5px; padding:3px 10px;
+             border-radius:6px; font-size:12px; font-weight:600; }
+    .badge.set { background:#f0fdf4; color:#15803d; }
+    .badge.off { background:#f3f4f6; color:#6b7280; }
+    .mask { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px;
+            background:#f3f4f6; border:1px solid var(--line); border-radius:6px;
+            padding:2px 8px; color:#374151; }
+
+    /* ── Small screens: sidebar becomes a top rail ───────────── */
+    @media (max-width:860px) {
+      .shell { flex-direction:column; }
+      .sidebar { position:static; height:auto; width:100%; }
+      .nav { flex-direction:row; overflow-x:auto; padding:0 8px 8px; gap:4px;
+             scrollbar-width:thin; }
+      .nav-item { width:auto; white-space:nowrap; padding:9px 13px; }
+      .nav-item.active { box-shadow:inset 0 -3px 0 var(--brand); }
+      .nav-label { display:none; }
+      .side-foot { flex-direction:row; border-top:none; padding:0 8px 10px; }
+      .side-foot .nav-item { flex:1; justify-content:center; }
+      .brand { padding:14px 16px 10px; }
+      .content { padding:18px 14px; }
+      .grid2, .grid3 { grid-template-columns:1fr; }
+      .topbar { padding:12px 16px; }
+    }
+    {% block style %}{% endblock %}
+  </style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="ic">🦷</span>
+      <span><b>Smile Dental Care</b><small>Admin panel</small></span>
+    </div>
+
+    <nav class="nav" aria-label="Admin sections">
+      <span class="nav-label">Manage</span>
+      <a class="nav-item {{ 'active' if nav == 'appointments' }}" href="/admin">📋 Appointments</a>
+      <a class="nav-item {{ 'active' if nav == 'settings' }}" href="/admin/settings">⚙️ Settings</a>
+      <a class="nav-item {{ 'active' if nav == 'account' }}" href="/admin/account">👤 Account</a>
+
+      <span class="nav-label">Elsewhere</span>
+      <a class="nav-item" href="/agent">💬 Agent Console</a>
+    </nav>
+
+    <div class="side-foot">
+      <form method="POST" action="/admin/logout">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+        <button class="nav-item" type="submit">🚪 Logout</button>
+      </form>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <h1>{% block heading %}Admin{% endblock %}</h1>
+      <span class="sub">Smile Dental Care</span>
+      {% if admin_name %}
+      <span class="who"><span class="av">{{ admin_name[:1]|upper }}</span>{{ admin_name }}</span>
+      {% endif %}
+    </header>
+
+    <main class="content">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+        <div class="flash {{ 'error' if category == 'error' else category }}">
+          <span>{{ message }}</span>
+          <button class="x" type="button" aria-label="Dismiss" onclick="this.parentNode.remove()">×</button>
+        </div>
+        {% endfor %}
+      {% endwith %}
+
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</div>
+{% block page_js %}{% endblock %}
+</body>
+</html>

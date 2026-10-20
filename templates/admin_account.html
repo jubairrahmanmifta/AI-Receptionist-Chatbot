@@ -1,0 +1,111 @@
+{% extends "admin_base.html" %}
+{% block title %}Account{% endblock %}
+{% block heading %}Account{% endblock %}
+{% block style %}
+  .warn { background:#fffbeb; border:1px solid #fde68a; color:#92400e;
+          border-radius:10px; padding:13px 16px; font-size:13.5px; line-height:1.6;
+          margin-bottom:18px; }
+  .warn b { display:block; margin-bottom:3px; }
+  .rule { font-size:12.5px; color:var(--muted); line-height:1.7;
+          background:#f9fafb; border:1px solid var(--line); border-radius:9px;
+          padding:12px 15px; }
+  .rule ul { margin-left:18px; }
+  .who-row { display:flex; gap:12px; align-items:center; margin-bottom:6px; }
+  .who-row .av { width:42px; height:42px; border-radius:50%; background:#eef2ff;
+                 color:var(--brand); display:grid; place-items:center;
+                 font-size:17px; font-weight:700; }
+  .who-row b { font-size:15px; display:block; }
+  .who-row small { font-size:12.5px; color:var(--muted); }
+{% endblock %}
+{% block content %}
+  {% if must_change %}
+  <div class="warn">
+    <b>🔒 You must change your password to continue.</b>
+    This account is still using its original password. Set a new one below and
+    the rest of the admin panel will unlock.
+  </div>
+  {% endif %}
+
+  {% if errors %}
+  <div class="err-list">
+    <strong>Please fix the following:</strong>
+    <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <div class="who-row">
+      <span class="av">{{ (form.username[:1] or '?')|upper }}</span>
+      <span><b>{{ form.display_name or form.username }}</b>
+        <small>@{{ form.username }} · owner</small></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="sect">
+      <h2>🔑 Change password</h2>
+      <p class="hint">Your current password is required to set a new one.</p>
+      <form method="POST" action="/admin/account">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+        <input type="hidden" name="action" value="password"/>
+        <div class="grid3">
+          <div class="field">
+            <label class="f" for="current_password">Current password</label>
+            <input class="inp" type="password" id="current_password"
+                   name="current_password" required autocomplete="current-password"/>
+          </div>
+          <div class="field">
+            <label class="f" for="new_password">New password</label>
+            <input class="inp" type="password" id="new_password"
+                   name="new_password" required minlength="8"
+                   autocomplete="new-password"/>
+          </div>
+          <div class="field">
+            <label class="f" for="confirm_password">Repeat new password</label>
+            <input class="inp" type="password" id="confirm_password"
+                   name="confirm_password" required minlength="8"
+                   autocomplete="new-password"/>
+          </div>
+        </div>
+        <div class="rule" style="margin-bottom:16px">
+          A valid new password must be:
+          <ul>
+            <li>at least <b>8 characters</b> long,</li>
+            <li>different from your <b>username</b>,</li>
+            <li>different from the original default password,</li>
+            <li>different from the password you're using right now.</li>
+          </ul>
+        </div>
+        <button class="btn" type="submit">Update password</button>
+      </form>
+    </div>
+
+    <div class="sect">
+      <h2>👤 Profile</h2>
+      <p class="hint">How your name appears in the admin panel and the agent
+        console.</p>
+      <form method="POST" action="/admin/account">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+        <input type="hidden" name="action" value="profile"/>
+        <div class="grid2">
+          <div class="field">
+            <label class="f" for="display_name">Display name</label>
+            <input class="inp" type="text" id="display_name" name="display_name"
+                   value="{{ form.display_name }}" maxlength="80" required
+                   autocomplete="name"/>
+            <div class="help">Max 80 characters.</div>
+          </div>
+          <div class="field">
+            <label class="f" for="username">Username</label>
+            <input class="inp" type="text" id="username" name="username"
+                   value="{{ form.username }}" maxlength="40" required
+                   autocomplete="username" spellcheck="false"/>
+            <div class="help">3–40 characters: letters, numbers, dots, dashes,
+              underscores.</div>
+          </div>
+        </div>
+        <button class="btn" type="submit">Save profile</button>
+      </form>
+    </div>
+  </div>
+{% endblock %}

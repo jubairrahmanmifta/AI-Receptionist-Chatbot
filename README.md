@@ -30,9 +30,10 @@ cp config.example.json config.json
 }
 ```
 
-Environment variables take priority over `config.json`. The `/admin/config`
-page still reads/writes the local `config.json` for the API key/model. Admin
-credentials are stored hashed in SQLite (see below).
+Environment variables take priority over `config.json`. The panel never writes
+`config.json`: the API key entered at **Settings** is stored in SQLite, and
+admin credentials are stored as hashes in SQLite. `config.json` remains only as
+a legacy fallback for the API key (see *Admin panel → Settings*).
 
 > ⚠️ `config.json`, `appointments.json`, `clinic.db`, `venv/`, `__pycache__/`,
 > `*.pyc`, and `.env` are gitignored. Never commit real secrets.
@@ -58,9 +59,81 @@ at request time by `prompt_builder.py` — nothing about the clinic is hardcoded
 ## URLs
 - Website   : http://localhost:5000
 - Admin     : http://localhost:5000/admin  (owner accounts only)
-- Settings  : http://localhost:5000/admin/config
+- Settings  : http://localhost:5000/admin/settings
+- Account   : http://localhost:5000/admin/account
 - Agent     : http://localhost:5000/agent/login  (agent/owner accounts)
 - Console   : http://localhost:5000/agent  (live agent console, after login)
+
+## Admin panel
+
+All owner pages share one responsive layout (`templates/admin_base.html`): a
+dark sidebar with Appointments / Settings / Account plus links to the Agent
+Console and Logout, a top bar showing who is signed in, and flash messages
+rendered at the top of the content area. It is a single `{% block content %}`
+per page — adding a page means one new template that extends the base and one
+`nav="…"` value.
+
+**Security on every `/admin` route**
+
+- **Login + role.** All routes require a signed-in account with role `owner`;
+  agent accounts get a hard `403` and anonymous visitors are redirected to
+  `/admin/login`.
+- **CSRF.** Every admin POST (login, logout, delete, settings, account) carries
+  a per-session token as a hidden `csrf_token` field — or the `X-CSRF-Token`
+  header for JSON — and the server rejects mismatches with `403`. Logout and
+  appointment deletion are POST-only (`GET` → `405`).
+- **Session cookies** are `HttpOnly` and `SameSite=Lax` always, and `Secure`
+  when `COOKIE_SECURE=1` (set it behind HTTPS). Logging in clears the incoming
+  session and mints a fresh CSRF token (session-fixation defence). Admin
+  sessions idle out after `SESSION_IDLE_HOURS` (default 8, configurable).
+- **Login throttle.** Five failed attempts per IP *or* per username within ten
+  minutes blocks that key for five minutes with one generic message
+  ("Too many failed attempts…"). Attempts are logged through the `logging`
+  module as `clinic.admin` warnings — usernames and IPs only, never passwords.
+- **Open redirect.** The `next` parameter after login is only honoured when it
+  is a same-site relative path (`/admin/...`); absolute URLs, `//host`,
+  backslashes and control characters fall back to `/admin`.
+- **Password change on first login.** `admins.must_change_password` forces
+  every page except **Account** and **Logout** to redirect there with an
+  explanation until a new password is set. Seeded owners start with the flag,
+  and owners still using the configured default password are flagged by an
+  idempotent startup migration (`DEMO_SEED` demo agents are never affected).
+
+**Account — `/admin/account`**
+
+Change display name, username, and password. Password changes require the
+current password, a minimum of 8 characters, and must differ from the username,
+the original default password, and the current password; failures re-render
+with a clear list of errors. Hashing is done with `werkzeug.security`.
+
+**Settings — `/admin/settings`**
+
+Grouped sections, all saved with one token-guarded POST:
+
+- **Clinic information** — name, address, phone, opening hours (EN + BN),
+  persona name, welcome messages, and extra info / FAQs as textareas, each with
+  a per-field length limit enforced server-side (`maxlength` + validation).
+- **AI** — `ai_model` text input with a `<datalist>` of suggestions
+  (including `openrouter/auto`) plus a note that auto-routing is inconsistent
+  and a fixed model is recommended for demos.
+- **OpenRouter API key** — write-only. The page only ever shows `Set`/`Not set`
+  and a masked tail (`••••abcd`, last four characters) together with the active
+  source. The stored value is never rendered in HTML, JSON or logs. Leaving the
+  field blank keeps the current key.
+  Resolution order: **`OPENROUTER_API_KEY` environment variable → key saved in
+  the `settings` table by this panel → `config.json` (legacy fallback)**.
+  A **Test AI connection** button (POST + CSRF) makes a tiny request and reports
+  success or a specific reason (invalid key, rate limit, timeout) without
+  exposing the key.
+- **Handoff timings** — `handoff_timeout_minutes`, `agent_online_window_seconds`,
+  `idle_close_minutes`, `customer_away_seconds`, `customer_left_seconds`, each
+  range-checked (`customer_left_seconds` now defaults to **300**; existing
+  databases still on the old `120` are migrated automatically).
+- **Preview system prompt** — BN and EN tabs showing the exact text
+  `build_system_prompt(lang)` produces right now, escaped in a scrollable `<pre>`.
+
+Settings are read from SQLite on every request, so changes reach the chatbot
+immediately — no restart.
 
 ## Human handoff (agents)
 
@@ -94,9 +167,9 @@ python create_agent.py            # prompts for username / display name / passwo
 Set `DEMO_SEED=1` in the environment to seed two demo agents (never done
 otherwise).
 
-Timing settings (editable in `settings`): `handoff_timeout_minutes` (5),
+Timing settings (editable at `/admin/settings`): `handoff_timeout_minutes` (5),
 `agent_online_window_seconds` (45), `idle_close_minutes` (30),
-`customer_away_seconds` (45), `customer_left_seconds` (120). The console's
+`customer_away_seconds` (45), `customer_left_seconds` (300). The console's
 quick answers live in `canned_replies_en` / `canned_replies_bn` (JSON lists of
 five clinic-style replies each, served by `GET /agent/api/canned`).
 
@@ -160,12 +233,21 @@ the chat become separate views with a back button).
 ```bash
 python test_booking.py    # 30 checks — booking pipeline
 python test_handoff.py    # 90 checks — sessions, state machine, agent API, widget API
+python test_admin.py      # 16 checks — admin panel security (unittest)
 ```
-Both run against a throwaway database with a mocked AI (normal booking, taken
-slot, invalid phone, non-working day, past date, malformed marker, atomic
-double-booking, reset, rate limit; plus handoff state transitions, agent races,
-permissions/CSRF, timeouts, session isolation, callbacks, canned replies and the
-console page).
+All three run against a throwaway database with a mocked AI (no network):
+
+- **booking** — normal booking, taken slot, invalid phone, non-working day,
+  past date, malformed marker, atomic double-booking, reset, rate limit;
+- **handoff** — handoff state transitions, agent races, permissions/CSRF,
+  timeouts, session isolation, callbacks, canned replies, console page;
+- **admin panel** — CSRF on every admin POST, agent accounts locked out with a
+  403, login throttling (per-IP and per-username) with password-free logging,
+  the forced first-login password change, open-redirect protection on `next`,
+  session cookie flags (`HttpOnly` / `SameSite=Lax` / `Secure` under
+  `COOKIE_SECURE=1`), session regeneration on login, POST-only logout and
+  delete, API-key non-exposure in HTML/JSON/prompt, password policy, settings
+  validation, and the removal of `/admin/config`.
 
 ## File structure
 ```
@@ -176,6 +258,7 @@ dental_v4/
 ├── create_agent.py     ← Create a human-agent account
 ├── test_booking.py     ← Booking pipeline tests (mocked AI, temp DB)
 ├── test_handoff.py     ← Human-handoff tests (mocked AI, temp DB)
+├── test_admin.py       ← Admin panel security tests (unittest, temp DB)
 ├── manual_test_widget.md ← Hands-on script for the browser widget
 ├── clinic.db           ← SQLite database (gitignored, auto-created)
 ├── config.example.json ← Template for config.json (safe to commit)
@@ -183,9 +266,11 @@ dental_v4/
 ├── requirements.txt    ← flask + requests + python-dotenv
 └── templates/
     ├── index.html          ← Main dental website + chat popup
+    ├── admin_base.html     ← Shared admin shell (sidebar, topbar, flash)
     ├── admin_login.html    ← Admin (owner) login
     ├── admin.html          ← Appointments table
-    ├── admin_config.html   ← Settings page
+    ├── admin_settings.html ← Settings (clinic info, AI, key, timings, preview)
+    ├── admin_account.html  ← Account (profile + password change)
     ├── agent_login.html    ← Agent login
     └── agent_console.html  ← Agent console (queue, transcript, callbacks)
 ```
@@ -216,4 +301,16 @@ Agent (login + CSRF header required):
 | GET  | `/agent/api/callbacks` | Callback requests, newest first |
 | POST | `/agent/api/callbacks/<id>/status` | `{status: new\|contacted\|done}` |
 | GET  | `/agent/api/canned` | Canned replies `{en: [...], bn: [...]}` |
+
+Admin (owner login + hidden `csrf_token` form field required on every POST):
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET  | `/admin/login` | Login form (issues the CSRF token) |
+| POST | `/admin/login` | Sign in as owner; `next` only honours same-site paths |
+| POST | `/admin/logout` | Sign out (`GET` → 405) |
+| GET  | `/admin` | Appointments list |
+| POST | `/admin/delete/<id>` | Delete an appointment (`GET` → 405) |
+| GET/POST | `/admin/settings` | Clinic info, AI model, API key, handoff timings |
+| POST | `/admin/settings/test_ai` | Tiny request to OpenRouter; reports ok/error, never the key |
+| GET/POST | `/admin/account` | Display name, username, password change |
 

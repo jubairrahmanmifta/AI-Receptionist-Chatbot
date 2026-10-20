@@ -222,15 +222,24 @@ r = cli_a.get("/admin")
 check("agent account gets 403 on /admin", r.status_code == 403)
 
 # 13. Owner can use /admin, agent cannot log into /admin ----------------------
+# /admin/login now carries a per-session CSRF token, so fetch the form first.
+def admin_login(client, username, password):
+    client.get("/admin/login")
+    with client.session_transaction() as sess:
+        token = sess.get("csrf_token", "")
+    return client.post("/admin/login", data={"username": username,
+                                             "password": password,
+                                             "csrf_token": token})
+
+
 if not db.get_admin("owner"):
     db.create_admin("owner", "ownerpw", display_name="Owner", role="owner")
 owner_cli = app.app.test_client()
-r = owner_cli.post("/admin/login", data={"username": "owner", "password": "ownerpw"})
+r = admin_login(owner_cli, "owner", "ownerpw")
 check("owner login redirects", r.status_code in (301, 302))
 r = owner_cli.get("/admin")
 check("owner can open /admin", r.status_code == 200)
-bad = app.app.test_client().post("/admin/login",
-                                 data={"username": "agent_a", "password": "agentpw"})
+bad = admin_login(app.app.test_client(), "agent_a", "agentpw")
 check("agent credentials rejected at /admin/login",
       bad.status_code == 200 and b"agent account" in bad.data.lower())
 

@@ -3,13 +3,15 @@ import re
 import json
 import time
 import hmac
+import logging
 import datetime
 import functools
 import secrets
 import threading
+from urllib.parse import urlparse
 from flask import (
     Flask, render_template, request,
-    jsonify, session, redirect, url_for
+    jsonify, session, redirect, url_for, flash
 )
 import requests
 
@@ -28,14 +30,51 @@ app = Flask(__name__)
 # Prefer the FLASK_SECRET_KEY env var; fall back to a random per-process key.
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
 
+
+def _env_flag(name):
+    """Return True when an env var is a common truthy string."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ─── SESSION COOKIE SECURITY ──────────────────────────────────────────────────
+# The session cookie is HttpOnly + SameSite=Lax always; COOKIE_SECURE=1 adds
+# Secure (use it behind HTTPS). SESSION_IDLE_HOURS caps how long an idle admin
+# session stays usable (checked server-side in _admin_gate()).
+SESSION_IDLE_HOURS = max(1, int(os.environ.get("SESSION_IDLE_HOURS", "8") or 8))
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=_env_flag("COOKIE_SECURE"),
+    PERMANENT_SESSION_LIFETIME=datetime.timedelta(hours=SESSION_IDLE_HOURS),
+)
+
+
+@app.before_request
+def _apply_cookie_flags():
+    """Re-read COOKIE_SECURE per request so it needs no restart (and is testable)."""
+    app.config["SESSION_COOKIE_SECURE"] = _env_flag("COOKIE_SECURE")
+
+
+# Failed admin logins: 5 per IP *or* per username in 10 minutes blocks that key
+# for 5 more minutes. In-memory on purpose — no background thread, no new deps.
+LOGIN_FAIL_LIMIT   = 5
+LOGIN_FAIL_WINDOW  = 600      # 10 minutes
+LOGIN_BLOCK_SECONDS = 300     # 5 minutes
+_login_failures = {}          # key -> [failure timestamps]
+_login_blocks   = {}          # key -> epoch until blocked
+_login_lock     = threading.Lock()
+
+ADMIN_LOGGER = logging.getLogger("clinic.admin")
+
 # ─── FILES ─────────────────────────────────────────────────────────────────────
 # Only secrets/API config stay in a JSON file (gitignored). Everything dynamic
 # — settings, doctors, services, appointments, admins — lives in SQLite (db.py).
 CONFIG_FILE = "config.json"
 
 # ─── LOAD CONFIG ───────────────────────────────────────────────────────────────
-# Environment variables take priority; config.json is the fallback (and is
-# still used by the /admin/config page for local, gitignored settings).
+# Environment variables take priority; config.json is the gitignored legacy
+# fallback. The panel never writes to this file — API keys entered in
+# /admin/settings are stored in SQLite instead.
 ENV_OVERRIDES = {
     "openrouter_api_key": "OPENROUTER_API_KEY",
     "admin_username":     "ADMIN_USERNAME",
@@ -56,11 +95,6 @@ def load_config():
         if value:
             cfg[key] = value
     return cfg
-
-def save_config(cfg):
-    """Write the local, gitignored config.json (used by /admin/config)."""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 def get_cfg(key):
     return load_config().get(key, "")
@@ -156,9 +190,13 @@ def _csrf_token():
 
 
 def _csrf_ok():
-    """Verify the X-CSRF-Token header against the session token."""
+    """Verify the CSRF token against this session's token.
+
+    Accepts the ``X-CSRF-Token`` header (JSON APIs) or the hidden
+    ``csrf_token`` form field (HTML forms).
+    """
     token = session.get("csrf_token")
-    sent = request.headers.get("X-CSRF-Token", "")
+    sent = request.headers.get("X-CSRF-Token", "") or request.form.get("csrf_token", "")
     if not token or not sent:
         return False
     return hmac.compare_digest(str(token), str(sent))
@@ -223,21 +261,62 @@ def _shape_message(m):
 
 
 # ─── AI CHAT ──────────────────────────────────────────────────────────────────
+# ─── OPENROUTER API KEY ────────────────────────────────────────────────────────
+# Resolution order: env OPENROUTER_API_KEY  ->  settings table (admin panel)
+# ->  config.json (legacy fallback). The value itself is never rendered.
+def _usable_key(value):
+    """True when ``value`` looks like a real key (not a placeholder)."""
+    value = (value or "").strip()
+    if not value or value.startswith("YOUR_") or "বসান" in value:
+        return False
+    return True
+
+
+def resolve_api_key():
+    """Return ``(key, source)`` where source is 'env', 'panel' or 'config'."""
+    env_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if _usable_key(env_key):
+        return env_key, "env"
+    panel_key = (db.get_setting("openrouter_api_key") or "").strip()
+    if _usable_key(panel_key):
+        return panel_key, "panel"
+    legacy_key = (load_config().get("openrouter_api_key") or "").strip()
+    if _usable_key(legacy_key):
+        return legacy_key, "config"
+    return "", ""
+
+
+def api_key_status():
+    """Return display info for the stored key: set flag, source, masked tail."""
+    key, source = resolve_api_key()
+    if not key:
+        return {"set": False, "source": None, "source_label": "Not set",
+                "masked": None}
+    labels = {
+        "env":    "Environment variable OPENROUTER_API_KEY",
+        "panel":  "Admin panel (saved in this database)",
+        "config": "config.json (legacy file)",
+    }
+    tail = key[-4:] if len(key) >= 4 else ""
+    return {"set": True, "source": source,
+            "source_label": labels.get(source, source),
+            "masked": "••••" + tail}
+
+
 def _openrouter_chat(messages, lang="bn"):
     """Send ``messages`` to OpenRouter and return the reply text.
 
     The model comes from the ``ai_model`` setting (fallback ``openrouter/auto``)
-    and the API key from ``OPENROUTER_API_KEY`` first, then ``config.json``.
-    Errors are returned as friendly bilingual strings.
+    and the API key from :func:`resolve_api_key` (env -> panel -> config.json).
+    Errors are returned as friendly bilingual strings and never include the key.
     """
-    cfg     = load_config()
-    api_key = os.environ.get("OPENROUTER_API_KEY") or cfg.get("openrouter_api_key", "")
+    api_key, _source = resolve_api_key()
     settings = db.get_settings()
     model   = (settings.get("ai_model") or "").strip() or "openrouter/auto"
     title   = (settings.get("clinic_name") or settings.get("clinic_name_bn")
                or "AI Receptionist")
 
-    if not api_key or api_key.startswith("YOUR_") or "বসান" in api_key:
+    if not api_key:
         return ("OPENROUTER_API_KEY env var অথবা config.json ফাইলে API key বসান।" if lang == "bn"
                 else "Please set OPENROUTER_API_KEY or your API key in config.json.")
 
@@ -287,6 +366,59 @@ def _openrouter_chat(messages, lang="bn"):
     except Exception as e:
         return (f"সমস্যা হয়েছে: {str(e)}" if lang == "bn"
                 else f"Something went wrong: {str(e)}")
+
+
+def test_ai_connection():
+    """Make a tiny OpenRouter request. Returns ``(ok, message)``.
+
+    The message is safe to show in the UI and in JSON: it never contains the
+    API key — only the HTTP outcome and which source supplied the key.
+    """
+    api_key, source = resolve_api_key()
+    if not api_key:
+        return False, ("No API key is configured. Set one below, export "
+                       "OPENROUTER_API_KEY, or add it to config.json.")
+    settings = db.get_settings()
+    model = (settings.get("ai_model") or "").strip() or "openrouter/auto"
+    source_label = {"env": "environment", "panel": "admin panel",
+                    "config": "config.json"}.get(source, source)
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json={"model": model,
+                  "messages": [{"role": "user", "content": "PING"}],
+                  "max_tokens": 5},
+            timeout=20,
+        )
+    except requests.exceptions.Timeout:
+        return False, ("Connection timed out after 20s. Check your network and "
+                       "try again.")
+    except requests.exceptions.ConnectionError:
+        return False, "Could not reach openrouter.ai. Check your internet connection."
+    except Exception:
+        return False, "The connection test failed unexpectedly."
+
+    code = resp.status_code
+    if code == 401:
+        return False, ("OpenRouter rejected the key (HTTP 401) — it is invalid "
+                       "or has been revoked. Source: %s." % source_label)
+    if code == 403:
+        return False, ("Access denied (HTTP 403). The key may lack credit or "
+                       "permission. Source: %s." % source_label)
+    if code == 404:
+        return False, ("Model not found (HTTP 404): %s. Pick another model "
+                       "below." % model)
+    if code == 429:
+        return False, ("Rate limited (HTTP 429) by OpenRouter. Wait a minute "
+                       "and try again.")
+    if code >= 500:
+        return False, ("OpenRouter server error (HTTP %d). Try again later." % code)
+    if code >= 400:
+        return False, ("Request rejected (HTTP %d). Check the model name." % code)
+    return True, ("Connected to OpenRouter (HTTP 200) using model '%s'. "
+                  "Key source: %s." % (model, source_label))
 
 
 def _history_messages(conversation_id):
@@ -752,45 +884,199 @@ def reset():
     return jsonify({"ok": True, "session_id": new_sid})
 
 # ─── ROUTES — ADMIN (owner only) ──────────────────────────────────────────────
-def owner_required(f):
-    """Allow only a logged-in owner; agent accounts get a hard 403."""
-    @functools.wraps(f)
-    def decorated(*args, **kwargs):
-        if session.get("admin_logged_in"):
-            if session.get("admin_role") != "owner":
-                return ("Forbidden — agent accounts cannot open /admin.", 403)
-            return f(*args, **kwargs)
+# Endpoints that stay reachable while a forced password change is pending.
+PASSWORD_GATE_EXEMPT = ("admin_account", "admin_logout")
+
+
+def _safe_next(target, fallback):
+    """Honour only same-site relative paths — blocks open redirects."""
+    if not target:
+        return fallback
+    target = str(target).strip()
+    if not target.startswith("/") or target.startswith("//") or "\\" in target:
+        return fallback
+    if any(ch in target for ch in "\r\n\t"):
+        return fallback
+    parsed = urlparse(target)
+    if parsed.scheme or parsed.netloc:
+        return fallback
+    return target
+
+
+# ─── LOGIN THROTTLE (in-memory) ───────────────────────────────────────────────
+def _login_keys(ip, username):
+    keys = ["ip:%s" % (ip or "unknown")]
+    if username:
+        keys.append("user:%s" % str(username).lower())
+    return keys
+
+
+def _login_blocked(ip, username):
+    """True while this IP or username is inside a lockout window."""
+    now = time.time()
+    with _login_lock:
+        for key in _login_keys(ip, username):
+            until = _login_blocks.get(key)
+            if until is None:
+                continue
+            if now < until:
+                return True
+            del _login_blocks[key]
+    return False
+
+
+def _login_failure(ip, username):
+    """Record a failed attempt; block the key once the limit is reached."""
+    now = time.time()
+    with _login_lock:
+        for key in _login_keys(ip, username):
+            recent = [t for t in _login_failures.get(key, [])
+                      if now - t < LOGIN_FAIL_WINDOW]
+            recent.append(now)
+            _login_failures[key] = recent
+            if len(recent) >= LOGIN_FAIL_LIMIT:
+                _login_blocks[key] = now + LOGIN_BLOCK_SECONDS
+                _login_failures.pop(key, None)
+
+
+def _login_success(ip, username):
+    """Clear counters for a key once it authenticates successfully."""
+    with _login_lock:
+        for key in _login_keys(ip, username):
+            _login_failures.pop(key, None)
+            _login_blocks.pop(key, None)
+
+
+def _session_idle_expired():
+    """True when the admin session has been idle longer than the limit."""
+    last = session.get("last_active")
+    if last is None:
+        return False
+    try:
+        last = float(last)
+    except (TypeError, ValueError):
+        return True
+    return (time.time() - last) > (SESSION_IDLE_HOURS * 3600)
+
+
+def _start_admin_session(admin):
+    """Clear the incoming session (fixation) and start a fresh owner session."""
+    session.clear()
+    session["admin_logged_in"] = True
+    session["admin_id"] = admin["id"]
+    session["admin_role"] = admin.get("role") or "owner"
+    session["admin_username"] = admin["username"]
+    session["admin_display_name"] = (admin.get("display_name")
+                                     or admin["username"])
+    session["last_active"] = time.time()
+    session.permanent = True
+    _csrf_token()   # a brand-new token after clearing the session
+
+
+def _admin_gate():
+    """Shared guard for /admin. Returns a response to send, or ``None``."""
+    if not session.get("admin_logged_in"):
         # Logged in as an agent (but not an owner) — refuse the admin area.
         if session.get("agent_id"):
             return ("Forbidden — agent accounts cannot open /admin.", 403)
         return redirect(url_for("admin_login"))
+    if session.get("admin_role") != "owner":
+        return ("Forbidden — agent accounts cannot open /admin.", 403)
+
+    admin = db.get_admin_by_id(session.get("admin_id"))
+    if not admin or admin.get("role") != "owner":
+        session.clear()
+        return redirect(url_for("admin_login"))
+    if _session_idle_expired():
+        session.clear()
+        flash("Your session expired after %d hours of inactivity — "
+              "please sign in again." % SESSION_IDLE_HOURS, "notice")
+        return redirect(url_for("admin_login"))
+    session["last_active"] = time.time()
+
+    if admin.get("must_change_password") and request.endpoint not in PASSWORD_GATE_EXEMPT:
+        flash("For your security, please choose a new password before using "
+              "the admin panel.", "notice")
+        return redirect(url_for("admin_account"))
+    return None
+
+
+def owner_required(f):
+    """Allow only a logged-in owner; agent accounts get a hard 403.
+
+    POST requests additionally need a valid CSRF token — either the hidden
+    ``csrf_token`` form field or the ``X-CSRF-Token`` header.
+    """
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        blocked = _admin_gate()
+        if blocked is not None:
+            return blocked
+        if request.method == "POST" and not _csrf_ok():
+            return ("Missing or invalid security token (CSRF). "
+                    "Go back, reload the page and try again.", 403)
+        return f(*args, **kwargs)
     return decorated
+
+
+# POST-only admin routes share the exact same guard.
+owner_post_required = owner_required
+
+
+@app.context_processor
+def _inject_admin_context():
+    """Expose the signed-in owner's name to the shared admin layout."""
+    name = session.get("admin_display_name")
+    if not name and session.get("admin_logged_in"):
+        row = db.get_admin_by_id(session.get("admin_id")) or {}
+        name = row.get("display_name") or row.get("username") or ""
+    return {"admin_name": name or ""}
 
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     error = None
+    nxt = (request.form.get("next") if request.method == "POST"
+           else request.args.get("next"))
     if request.method == "POST":
-        username = request.form.get("username", "")
-        password = request.form.get("password", "")
-        admin = db.verify_admin(username, password)
-        if admin and admin.get("role") == "owner":
-            session["admin_logged_in"] = True
-            session["admin_id"] = admin["id"]
-            session["admin_role"] = "owner"
-            session["admin_username"] = admin["username"]
-            _csrf_token()
-            return redirect(url_for("admin_panel"))
-        if admin and admin.get("role") == "agent":
-            error = "This is an agent account — please use the agent login."
+        if not _csrf_ok():
+            return ("Missing or invalid security token (CSRF). "
+                    "Reload the page and try again.", 403)
+        ip = _client_ip()
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        if _login_blocked(ip, username):
+            ADMIN_LOGGER.warning("Admin login blocked: username=%r ip=%s",
+                                 username, ip)
+            error = ("Too many failed attempts. Please wait a few minutes "
+                     "and try again.")
         else:
-            error = "Invalid username or password."
-    return render_template("admin_login.html", error=error)
+            admin = db.verify_admin(username, password) if username else None
+            if admin and admin.get("role") == "owner":
+                _login_success(ip, username)
+                _start_admin_session(admin)
+                if admin.get("must_change_password"):
+                    flash("Please choose a new password to continue.", "notice")
+                    return redirect(url_for("admin_account"))
+                return redirect(_safe_next(nxt, url_for("admin_panel")))
+            if admin and admin.get("role") == "agent":
+                # Right password, wrong portal — don't count it as a failure.
+                _login_success(ip, username)
+                error = "This is an agent account — please use the agent login."
+            else:
+                _login_failure(ip, username)
+                ADMIN_LOGGER.warning("Admin login failed: username=%r ip=%s",
+                                     username, ip)
+                error = "Invalid username or password."
+    return render_template("admin_login.html", error=error,
+                           next_value=_safe_next(nxt, ""))
 
 
-@app.route("/admin/logout")
+@app.route("/admin/logout", methods=["POST"])
+@owner_post_required
 def admin_logout():
     session.clear()
+    flash("You have been signed out.", "success")
     return redirect(url_for("admin_login"))
 
 
@@ -799,40 +1085,242 @@ def admin_logout():
 def admin_panel():
     appts = db.list_appointments()
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    return render_template("admin.html", appointments=appts, now_date=today)
+    return render_template("admin.html", appointments=appts, now_date=today,
+                           nav="appointments")
 
 
 @app.route("/admin/delete/<int:appt_id>", methods=["POST"])
-@owner_required
+@owner_post_required
 def admin_delete(appt_id):
-    db.delete_appointment(appt_id)
+    if db.delete_appointment(appt_id):
+        flash("Appointment deleted.", "success")
+    else:
+        flash("That appointment no longer exists.", "error")
     return redirect(url_for("admin_panel"))
 
 
-# ─── CONFIG API (for live status check on settings page) ──────────────────────
-@app.route("/admin/config", methods=["GET", "POST"])
-@owner_required
-def admin_config():
-    msg = None
-    if request.method == "POST":
-        cfg = load_config()
-        cfg["openrouter_api_key"] = request.form.get("api_key", "").strip()
-        cfg["openrouter_model"]   = request.form.get("model", "").strip()
-        save_config(cfg)
-        db.set_setting("ai_model", cfg["openrouter_model"])
+# ─── ADMIN: SETTINGS FIELD SPEC ───────────────────────────────────────────────
+# Text fields: (key, label, max length).
+ADMIN_TEXT_FIELDS = [
+    ("clinic_name",      "Clinic name (English)", 120),
+    ("clinic_name_bn",   "ক্লিনিকের নাম (বাংলা)", 120),
+    ("address",          "Address (English)", 200),
+    ("address_bn",       "ঠিকানা (বাংলা)", 200),
+    ("phone",            "Phone number", 40),
+    ("opening_hours",    "Opening hours (English)", 200),
+    ("opening_hours_bn", "খোলার সময় (বাংলা)", 200),
+    ("persona_name",     "Receptionist name (English)", 60),
+    ("persona_name_bn",  "রিসেপশনিস্টের নাম (বাংলা)", 60),
+    ("welcome_en",       "Welcome message (English)", 300),
+    ("welcome_bn",       "স্বাগত বার্তা (বাংলা)", 300),
+    ("ai_model",         "AI model", 120),
+]
+# Text areas: (key, label, max length).
+ADMIN_TEXTAREA_FIELDS = [
+    ("extra_info_en", "Extra info (FAQs / policies) — English", 4000),
+    ("extra_info_bn", "অতিরিক্ত তথ্য (FAQ / নীতিমালা) — বাংলা", 4000),
+]
+# Numeric fields: (key, label, minimum, maximum, unit).
+ADMIN_INT_FIELDS = [
+    ("handoff_timeout_minutes",     "Handoff timeout",       1,   60,   "minutes"),
+    ("agent_online_window_seconds", "Agent online window",   10,  600,   "seconds"),
+    ("idle_close_minutes",          "Idle chat auto-close",  1,   1440,  "minutes"),
+    ("customer_away_seconds",       "Customer marked 'away'", 5,   600,  "seconds"),
+    ("customer_left_seconds",       "Customer marked 'left'", 10,  3600,  "seconds"),
+]
+# Shown in the datalist under the AI model input.
+AI_MODEL_SUGGESTIONS = [
+    "openrouter/auto",
+    "openai/gpt-4o-mini",
+    "anthropic/claude-3.5-sonnet",
+    "google/gemini-flash-1.5",
+    "meta-llama/llama-3.1-70b-instruct",
+]
+MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._\-/:]+$")
 
-        # Admin credentials live in SQLite as a hash.
-        current = db.list_admins()
-        if current:
-            admin_id = current[0]["id"]
-            new_username = request.form.get("admin_username", "").strip() or None
-            new_pass     = request.form.get("admin_password", "").strip() or None
-            db.update_admin(admin_id, username=new_username, password=new_pass)
-        msg = "Settings saved!"
-    cfg = load_config()
-    admins = db.list_admins()
-    cfg["admin_username"] = admins[0]["username"] if admins else ""
-    return render_template("admin_config.html", cfg=cfg, msg=msg)
+# Field groups for the Settings page, selected from ADMIN_TEXT_FIELDS by key so
+# reordering the spec above can't silently scramble the sections.
+_FIELD_SPEC_BY_KEY = {key: (key, label, maxlen)
+                      for key, label, maxlen in ADMIN_TEXT_FIELDS}
+CLINIC_FIELDS = [_FIELD_SPEC_BY_KEY[k] for k in (
+    "clinic_name", "clinic_name_bn", "address", "address_bn", "phone",
+    "opening_hours", "opening_hours_bn")]
+PERSONA_FIELDS = [_FIELD_SPEC_BY_KEY[k] for k in (
+    "persona_name", "persona_name_bn", "welcome_en", "welcome_bn")]
+# ADMIN_TEXT_FIELDS also holds "ai_model", which gets its own AI section.
+
+
+@app.route("/admin/settings", methods=["GET", "POST"])
+@owner_required
+def admin_settings():
+    settings = db.get_settings()
+    errors = []
+    values = {key: (settings.get(key) or "")
+              for key, _label, _max in ADMIN_TEXT_FIELDS}
+    values.update({key: (settings.get(key) or "")
+                   for key, _label, _max in ADMIN_TEXTAREA_FIELDS})
+    values.update({key: (settings.get(key) or "")
+                   for key, _label, _lo, _hi, _unit in ADMIN_INT_FIELDS})
+
+    if request.method == "POST":
+        typed = dict(values)
+        for key, label, maxlen in ADMIN_TEXT_FIELDS:
+            if key not in request.form:
+                continue
+            value = request.form.get(key, "").strip()
+            typed[key] = value
+            if len(value) > maxlen:
+                errors.append("%s must be %d characters or fewer."
+                              % (label, maxlen))
+            elif key == "ai_model" and value and not MODEL_NAME_RE.match(value):
+                errors.append("AI model may only contain letters, numbers and "
+                              "the characters . _ - / :")
+        for key, label, maxlen in ADMIN_TEXTAREA_FIELDS:
+            if key not in request.form:
+                continue
+            value = request.form.get(key, "")
+            typed[key] = value
+            if len(value) > maxlen:
+                errors.append("%s must be %d characters or fewer."
+                              % (label, maxlen))
+        for key, label, lo, hi, unit in ADMIN_INT_FIELDS:
+            if key not in request.form:
+                continue
+            raw = (request.form.get(key) or "").strip()
+            typed[key] = raw
+            try:
+                amount = int(raw)
+            except (TypeError, ValueError):
+                errors.append("%s must be a whole number of %s."
+                              % (label, unit))
+                continue
+            if amount < lo or amount > hi:
+                errors.append("%s must be between %d and %d %s."
+                              % (label, lo, hi, unit))
+        new_key = (request.form.get("openrouter_api_key") or "").strip()
+        if new_key:
+            if len(new_key) > 300:
+                errors.append("That API key looks too long.")
+            elif not _usable_key(new_key):
+                errors.append("That looks like a placeholder, not a real key. "
+                              "Paste the key from openrouter.ai.")
+
+        if errors:
+            # Re-render exactly what was typed so nothing is lost.
+            return render_template("admin_settings.html", nav="settings",
+                                   values=typed, errors=errors,
+                                   clinic_fields=CLINIC_FIELDS,
+                                   persona_fields=PERSONA_FIELDS,
+                                   textarea_fields=ADMIN_TEXTAREA_FIELDS,
+                                   int_fields=ADMIN_INT_FIELDS,
+                                   key_status=api_key_status(),
+                                   models=AI_MODEL_SUGGESTIONS,
+                                   prompt_bn=prompt_builder.build_system_prompt("bn"),
+                                   prompt_en=prompt_builder.build_system_prompt("en"))
+
+        for key, _label, _max in ADMIN_TEXT_FIELDS:
+            if key in request.form:
+                db.set_setting(key, request.form.get(key, "").strip())
+        for key, _label, _max in ADMIN_TEXTAREA_FIELDS:
+            if key in request.form:
+                db.set_setting(key, request.form.get(key, ""))
+        for key, _label, _lo, _hi, _unit in ADMIN_INT_FIELDS:
+            if key in request.form:
+                db.set_setting(key, typed.get(key, "").strip())
+        if new_key:
+            db.set_setting("openrouter_api_key", new_key)
+        flash("Settings saved — the chatbot uses them immediately, "
+              "no restart needed.", "success")
+        return redirect(url_for("admin_settings"))
+
+    return render_template("admin_settings.html", nav="settings", values=values,
+                           errors=errors, clinic_fields=CLINIC_FIELDS,
+                           persona_fields=PERSONA_FIELDS,
+                           textarea_fields=ADMIN_TEXTAREA_FIELDS,
+                           int_fields=ADMIN_INT_FIELDS,
+                           key_status=api_key_status(),
+                           models=AI_MODEL_SUGGESTIONS,
+                           prompt_bn=prompt_builder.build_system_prompt("bn"),
+                           prompt_en=prompt_builder.build_system_prompt("en"))
+
+
+@app.route("/admin/settings/test_ai", methods=["POST"])
+@owner_post_required
+def admin_settings_test_ai():
+    """Tiny OpenRouter request; reports success/failure without the key."""
+    ok, message = test_ai_connection()
+    return jsonify({"ok": ok, "message": message})
+
+
+@app.route("/admin/account", methods=["GET", "POST"])
+@owner_required
+def admin_account():
+    admin = db.get_admin_by_id(session.get("admin_id")) or {}
+    errors = []
+    form = {"display_name": session.get("admin_display_name") or admin.get("display_name") or "",
+            "username": session.get("admin_username") or admin.get("username") or ""}
+
+    if request.method == "POST":
+        if request.form.get("action") == "password":
+            current = request.form.get("current_password") or ""
+            new = request.form.get("new_password") or ""
+            confirm = request.form.get("confirm_password") or ""
+            if not db.verify_admin(admin.get("username"), current):
+                errors.append("Your current password is incorrect.")
+            if new != confirm:
+                errors.append("The two new passwords don't match.")
+            errors.extend(_password_policy_errors(form["username"], new, current))
+            if not errors:
+                db.update_admin(admin["id"], password=new,
+                                must_change_password=False)
+                flash("Password updated.", "success")
+                return redirect(url_for("admin_account"))
+        else:
+            display = (request.form.get("display_name") or "").strip()
+            username = (request.form.get("username") or "").strip()
+            form["display_name"] = display
+            form["username"] = username
+            if not display:
+                errors.append("Display name is required.")
+            elif len(display) > 80:
+                errors.append("Display name must be 80 characters or fewer.")
+            if not username:
+                errors.append("Username is required.")
+            elif not re.match(r"^[A-Za-z0-9_.\-]{3,40}$", username):
+                errors.append("Username must be 3–40 characters using only "
+                              "letters, numbers, dots, dashes or underscores.")
+            else:
+                other = db.get_admin(username)
+                if other and other["id"] != admin.get("id"):
+                    errors.append("That username is already taken.")
+            if not errors:
+                db.update_admin(admin["id"], username=username,
+                                display_name=display)
+                session["admin_username"] = username
+                session["admin_display_name"] = display
+                flash("Profile updated.", "success")
+                return redirect(url_for("admin_account"))
+
+    return render_template("admin_account.html", nav="account",
+                           errors=errors, form=form,
+                           must_change=bool(admin.get("must_change_password")))
+
+
+def _password_policy_errors(username, new_password, current_password=None):
+    """Validate a proposed password. Returns a list of friendly errors."""
+    errors = []
+    if len(new_password) < 8:
+        errors.append("The new password must be at least 8 characters.")
+    if new_password and new_password.lower() == (username or "").lower():
+        errors.append("The password can't be your username.")
+    default_password = (os.environ.get("ADMIN_PASSWORD")
+                        or load_config().get("admin_password") or "")
+    if default_password and new_password == default_password:
+        errors.append("That's the original default password — please choose "
+                      "a different one.")
+    if current_password is not None and new_password == current_password:
+        errors.append("The new password must be different from the current one.")
+    return errors
 
 
 # ─── ROUTES — AGENT (login + JSON API) ────────────────────────────────────────

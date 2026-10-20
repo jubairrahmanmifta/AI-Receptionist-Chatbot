@@ -1,0 +1,251 @@
+{% extends "admin_base.html" %}
+{% block title %}Settings{% endblock %}
+{% block heading %}Settings{% endblock %}
+{% block style %}
+  .pill { display:inline-flex; align-items:center; gap:6px; font-size:12.5px;
+          background:#fff; border:1px solid var(--line); border-radius:20px;
+          padding:5px 12px; color:#374151; margin-bottom:10px; }
+  .note { background:#eff6ff; border:1px solid #dbeafe; color:#1e40af;
+          border-radius:9px; padding:10px 13px; font-size:12.5px; line-height:1.55; }
+  .kv { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:14px; }
+  .key-row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  .key-row .field { flex:1; min-width:240px; margin-bottom:0; }
+  #test-ai-form { display:inline-block; }
+  .ai-test { margin-top:12px; font-size:13px; line-height:1.55; padding:11px 14px;
+             border-radius:9px; border:1px solid; display:none; white-space:pre-wrap; }
+  .ai-test.show { display:block; }
+  .ai-test.ok   { background:#f0fdf4; border-color:#bbf7d0; color:#166534; }
+  .ai-test.bad  { background:#fef2f2; border-color:#fecaca; color:#b91c1c; }
+  .ai-test.run  { background:#f9fafb; border-color:var(--line); color:#374151; }
+  .ptabs { display:flex; gap:6px; margin-bottom:10px; }
+  .ptab { padding:6px 16px; font-size:13px; font-weight:600; font-family:inherit;
+          background:#fff; border:1px solid var(--line); border-radius:8px;
+          color:#6b7280; cursor:pointer; }
+  .ptab.on { background:var(--brand); border-color:var(--brand); color:#fff; }
+  pre.prompt { background:#0f172a; color:#e2e8f0; border-radius:10px; padding:16px;
+               font-size:12.5px; line-height:1.6; max-height:420px; overflow:auto;
+               white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,
+               SFMono-Regular,Menlo,Consolas,monospace; }
+  .actions { display:flex; gap:10px; flex-wrap:wrap; align-items:center;
+             padding-top:6px; }
+  .int-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+             gap:16px; }
+  .int-row .unit { font-size:11.5px; color:var(--muted); margin-top:5px; }
+{% endblock %}
+{% block content %}
+  {% if errors %}
+  <div class="err-list">
+    <strong>Please fix the following:</strong>
+    <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  {# ── Everything except the secret key lives in one form ── #}
+  <form method="POST" action="/admin/settings" id="settings-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+
+    <div class="card">
+      <div class="sect">
+        <h2>🏥 Clinic information</h2>
+        <p class="hint">Shown to customers and injected into the AI prompt.
+          English and Bangla are stored separately — leave one blank only if the
+          other language should be used as a fallback.</p>
+        <div class="grid2">
+          {% for key, label, maxlen in clinic_fields %}
+          <div class="field">
+            <label class="f" for="{{ key }}">{{ label }}</label>
+            <input class="inp" type="text" id="{{ key }}" name="{{ key }}"
+                   value="{{ values.get(key, '') }}" maxlength="{{ maxlen }}"
+                   {% if key == 'phone' %}inputmode="tel"{% endif %}/>
+            <div class="help">Max {{ maxlen }} characters.</div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="sect">
+        <h2>🤖 Persona</h2>
+        <p class="hint">The bot's name and how it greets people, per language.</p>
+        <div class="grid2">
+          {% for key, label, maxlen in persona_fields %}
+          <div class="field">
+            <label class="f" for="{{ key }}">{{ label }}</label>
+            <input class="inp" type="text" id="{{ key }}" name="{{ key }}"
+                   value="{{ values.get(key, '') }}" maxlength="{{ maxlen }}"/>
+            <div class="help">Max {{ maxlen }} characters.</div>
+          </div>
+          {% endfor %}
+        </div>
+        {% for key, label, maxlen in textarea_fields %}
+        <div class="field">
+          <label class="f" for="{{ key }}">{{ label }}</label>
+          <textarea class="inp" id="{{ key }}" name="{{ key }}"
+                    maxlength="{{ maxlen }}"
+                    placeholder="Frequently asked questions, policies, directions…">{{ values.get(key, '') }}</textarea>
+          <div class="help">Max {{ maxlen }} characters. Newlines are kept.</div>
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="sect">
+        <h2>🧠 AI</h2>
+        <div class="field">
+          <label class="f" for="ai_model">Model</label>
+          <input class="inp" type="text" id="ai_model" name="ai_model"
+                 value="{{ values.get('ai_model', '') }}" list="model-list"
+                 maxlength="120" autocomplete="off"/>
+          <datalist id="model-list">
+            {% for m in models %}<option value="{{ m }}"></option>{% endfor %}
+          </datalist>
+          <div class="help">Pick a fixed model for demos — <code>openrouter/auto</code>
+            routing can behave inconsistently (answers may change between
+            requests), so a fixed model is recommended.</div>
+        </div>
+        <div class="note">💡 Auto-routing picks a different provider per request.
+          It is convenient for experimenting, but for a stable demo set an exact
+          model such as <b>openai/gpt-4o-mini</b>.</div>
+      </div>
+
+      <div class="sect">
+        <h2>⏱ Handoff timings</h2>
+        <p class="hint">How the human-handoff queue behaves. Saved values are
+          used immediately — no restart.</p>
+        <div class="int-row">
+          {% for key, label, lo, hi, unit in int_fields %}
+          <div class="field">
+            <label class="f" for="{{ key }}">{{ label }}</label>
+            <input class="inp" type="number" id="{{ key }}" name="{{ key }}"
+                   value="{{ values.get(key, '') }}" min="{{ lo }}" max="{{ hi }}"
+                   step="1" inputmode="numeric"/>
+            <div class="unit">{{ lo }}–{{ hi }} {{ unit }}</div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn" type="submit">💾 Save settings</button>
+        <span class="help">Saved changes reach the chatbot instantly.</span>
+      </div>
+    </div>
+  </form>
+
+  {# ── Write-only secret: its own form, never re-rendered ── #}
+  <div class="card">
+    <div class="sect">
+      <h2>🔑 OpenRouter API key</h2>
+      <p class="hint">Write-only. The stored key is never sent back to the
+        browser, JSON or logs — only its state and last four characters are
+        shown. Leaving the field blank keeps the current key.</p>
+
+      <div class="kv">
+        {% if key_status.set %}
+        <span class="pill"><span class="badge set">Set</span>
+          <span class="mask">{{ key_status.masked }}</span></span>
+        <span class="pill">Source: <b>{{ key_status.source_label }}</b></span>
+        {% else %}
+        <span class="pill"><span class="badge off">Not set</span></span>
+        {% endif %}
+      </div>
+
+      <div class="help" style="margin-bottom:12px">
+        Resolution order: <b>1.</b> environment variable
+        <code>OPENROUTER_API_KEY</code> → <b>2.</b> this panel →
+        <b>3.</b> <code>config.json</code> (legacy file). The active source is
+        shown above; the value never is.
+      </div>
+
+      <form method="POST" action="/admin/settings" id="key-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+        <div class="key-row">
+          <div class="field">
+            <label class="f" for="openrouter_api_key">Paste a new key
+              <span class="opt">(optional)</span></label>
+            <input class="inp" type="password" id="openrouter_api_key"
+                   name="openrouter_api_key" value="" placeholder="sk-or-…"
+                   maxlength="300" autocomplete="off" spellcheck="false"/>
+          </div>
+          <button class="btn" type="submit">💾 Save key</button>
+        </div>
+        <div class="help">Stored in SQLite as a normal setting — the key itself
+          never appears in this page's HTML.</div>
+      </form>
+    </div>
+
+    <div class="sect">
+      <h3>Test connection</h3>
+      <form method="POST" action="/admin/settings/test_ai" id="test-ai-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+        <button class="btn ghost" type="submit" id="ai-test-btn">🔌 Test AI connection</button>
+      </form>
+      <div class="ai-test" id="ai-test-result" role="status" aria-live="polite"></div>
+      <div class="help">Sends a one-word request. The reply reports success or
+        the reason it failed (invalid key, rate limit, timeout) without ever
+        revealing the key.</div>
+    </div>
+  </div>
+
+  {# ── Prompt preview ── #}
+  <div class="card">
+    <h2>📜 Preview system prompt</h2>
+    <p class="hint">Exactly what <code>build_system_prompt(lang)</code> produces
+      right now, for the current settings and data. Escaped as plain text.</p>
+    <div class="ptabs" role="tablist">
+      <button class="ptab on" type="button" data-pane="prompt-bn" role="tab">বাংলা</button>
+      <button class="ptab" type="button" data-pane="prompt-en" role="tab">English</button>
+    </div>
+    <pre class="prompt" id="prompt-bn">{{ prompt_bn }}</pre>
+    <pre class="prompt" id="prompt-en" hidden>{{ prompt_en }}</pre>
+  </div>
+{% endblock %}
+
+{% block page_js %}
+<script>
+(function () {
+  "use strict";
+  var meta = document.querySelector('meta[name="csrf-token"]');
+  var token = meta ? meta.content : "";
+
+  // ── Tabs for the prompt preview (text is already in the DOM, just shown) ──
+  var tabs = document.querySelectorAll(".ptab");
+  Array.prototype.forEach.call(tabs, function (tab) {
+    tab.addEventListener("click", function () {
+      Array.prototype.forEach.call(tabs, function (t) { t.classList.remove("on"); });
+      tab.classList.add("on");
+      ["prompt-bn", "prompt-en"].forEach(function (id) {
+        var pane = document.getElementById(id);
+        if (pane) { pane.hidden = (id !== tab.getAttribute("data-pane")); }
+      });
+    });
+  });
+
+  // ── Test AI connection (POST + CSRF, result rendered with textContent) ───
+  var testForm = document.getElementById("test-ai-form");
+  var testBtn  = document.getElementById("ai-test-btn");
+  var testOut  = document.getElementById("ai-test-result");
+  if (testForm && testBtn && testOut) {
+    testForm.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      testBtn.disabled = true;
+      testOut.className = "ai-test show run";
+      testOut.textContent = "Testing the connection…";
+      fetch(testForm.action, {
+        method: "POST",
+        headers: { "X-CSRF-Token": token, "Accept": "application/json" },
+        body: new FormData(testForm)
+      }).then(function (res) { return res.json(); })
+        .then(function (data) {
+          testOut.className = "ai-test show " + (data && data.ok ? "ok" : "bad");
+          testOut.textContent = (data && data.message)
+            ? data.message : "Unexpected response from the server.";
+        })
+        .catch(function () {
+          testOut.className = "ai-test show bad";
+          testOut.textContent = "Could not reach the server — check your connection.";
+        })
+        .then(function () { testBtn.disabled = false; });
+    });
+  }
+}());
+</script>
+{% endblock %}

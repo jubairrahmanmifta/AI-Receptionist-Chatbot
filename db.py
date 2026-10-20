@@ -152,13 +152,14 @@ CREATE TABLE IF NOT EXISTS appointments (
 );
 
 CREATE TABLE IF NOT EXISTS admins (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT UNIQUE,
-    password_hash TEXT,
-    display_name  TEXT,
-    role          TEXT DEFAULT 'owner',   -- 'owner' or 'agent'
-    is_online     INTEGER DEFAULT 0,
-    last_seen     TEXT
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    username             TEXT UNIQUE,
+    password_hash        TEXT,
+    display_name         TEXT,
+    role                 TEXT DEFAULT 'owner',   -- 'owner' or 'agent'
+    is_online            INTEGER DEFAULT 0,
+    last_seen            TEXT,
+    must_change_password INTEGER DEFAULT 0       -- 1 = forced to change it first
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -263,7 +264,7 @@ SEED_DATA = {
         "idle_close_minutes": "30",
         # How long a silent customer is considered "away" / "gone" while queued.
         "customer_away_seconds": "45",
-        "customer_left_seconds": "120",
+        "customer_left_seconds": "300",
         # Agent console quick replies (JSON lists; editable later in /admin).
         "canned_replies_en": json.dumps(CANNED_REPLIES_EN, ensure_ascii=False),
         "canned_replies_bn": json.dumps(CANNED_REPLIES_BN, ensure_ascii=False),
@@ -341,13 +342,15 @@ def _migrate_columns():
             conn.execute("ALTER TABLE appointments ADD COLUMN session_id TEXT")
             print("[db] Added column appointments.session_id")
 
-        # Human-handoff columns.
+        # Human-handoff columns + the forced-password-change flag.
         admin_cols = _table_columns(conn, "admins")
         for col, ddl in (
             ("display_name", "ALTER TABLE admins ADD COLUMN display_name TEXT"),
             ("role", "ALTER TABLE admins ADD COLUMN role TEXT DEFAULT 'owner'"),
             ("is_online", "ALTER TABLE admins ADD COLUMN is_online INTEGER DEFAULT 0"),
             ("last_seen", "ALTER TABLE admins ADD COLUMN last_seen TEXT"),
+            ("must_change_password",
+             "ALTER TABLE admins ADD COLUMN must_change_password INTEGER DEFAULT 0"),
         ):
             if col not in admin_cols:
                 conn.execute(ddl)
@@ -387,7 +390,7 @@ def _seed_missing_settings():
         "agent_online_window_seconds": "45",
         "idle_close_minutes": "30",
         "customer_away_seconds": "45",
-        "customer_left_seconds": "120",
+        "customer_left_seconds": "300",
         "canned_replies_en": json.dumps(CANNED_REPLIES_EN, ensure_ascii=False),
         "canned_replies_bn": json.dumps(CANNED_REPLIES_BN, ensure_ascii=False),
     }
@@ -398,6 +401,23 @@ def _seed_missing_settings():
                 conn.execute(
                     "INSERT INTO settings(key, value) VALUES (?, ?)", (key, value)
                 )
+
+
+# The value ``customer_left_seconds`` shipped with before this release.
+_OLD_CUSTOMER_LEFT_DEFAULT = "120"
+
+
+def _migrate_settings():
+    """One-off setting upgrades. Only touches values still on the old default."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'customer_left_seconds'"
+        ).fetchone()
+        if row and str(row["value"]).strip() == _OLD_CUSTOMER_LEFT_DEFAULT:
+            conn.execute(
+                "UPDATE settings SET value = '300' WHERE key = 'customer_left_seconds'"
+            )
+            print("[db] Migrated customer_left_seconds 120 -> 300")
 
 
 SENDER_BY_ROLE = {"user": "customer", "assistant": "bot", "system": "system"}
@@ -652,10 +672,12 @@ def init_db(ai_model="openrouter/auto", admin_username=None, admin_password=None
     _migrate_columns()
     _seed_if_empty(ai_model)
     _seed_missing_settings()
+    _migrate_settings()
     _backfill_price_max()
     _migrate_conversations()
     if admin_username and admin_password:
         ensure_admin(admin_username, admin_password)
+        _flag_default_password_owners(admin_username, admin_password)
     _seed_demo_agents()
     _migrate_appointments_json()
 
@@ -1460,7 +1482,7 @@ def run_housekeeping():
         # A waiting customer who stopped reaching the server (closed the tab) is
         # treated as gone and the conversation is closed.
         try:
-            gone = int(float(_connection_setting(conn, "customer_left_seconds", 120)))
+            gone = int(float(_connection_setting(conn, "customer_left_seconds", 300)))
         except (TypeError, ValueError):
             gone = 120
         gone_cutoff = (now - datetime.timedelta(seconds=gone)).isoformat()
@@ -1814,27 +1836,31 @@ def get_admin_by_id(admin_id):
     """Return an admin row (without the hash) or ``None``."""
     with _connect() as conn:
         row = conn.execute(
-            """SELECT id, username, display_name, role, is_online, last_seen
+            """SELECT id, username, display_name, role, is_online, last_seen,
+                      must_change_password
                FROM admins WHERE id = ?""",
             (admin_id,),
         ).fetchone()
     return dict(row) if row else None
 
 
-def create_admin(username, password, display_name=None, role="owner"):
+def create_admin(username, password, display_name=None, role="owner",
+                 must_change_password=0):
     """Create an admin/agent with a hashed password. Returns the new id."""
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO admins(username, password_hash, display_name, role)
-               VALUES (?, ?, ?, ?)""",
-            (username, generate_password_hash(password), display_name, role),
+            """INSERT INTO admins(username, password_hash, display_name, role,
+                                  must_change_password)
+               VALUES (?, ?, ?, ?, ?)""",
+            (username, generate_password_hash(password), display_name, role,
+             1 if must_change_password else 0),
         )
     return cur.lastrowid
 
 
 def update_admin(admin_id, username=None, password=None, display_name=None,
-                 role=None):
-    """Update an admin's username/password/display_name/role. Returns True."""
+                 role=None, must_change_password=None):
+    """Update an admin's username/password/display_name/role/flag. Returns True."""
     updates = {}
     if username:
         updates["username"] = username
@@ -1844,6 +1870,8 @@ def update_admin(admin_id, username=None, password=None, display_name=None,
         updates["display_name"] = display_name
     if role:
         updates["role"] = role
+    if must_change_password is not None:
+        updates["must_change_password"] = 1 if must_change_password else 0
     if not updates:
         return False
     assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -1851,6 +1879,16 @@ def update_admin(admin_id, username=None, password=None, display_name=None,
         cur = conn.execute(
             f"UPDATE admins SET {assignments} WHERE id = ?",
             (*updates.values(), admin_id),
+        )
+        return cur.rowcount > 0
+
+
+def set_must_change_password(admin_id, flag=True):
+    """Turn the forced-password-change flag on or off. Returns True."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE admins SET must_change_password = ? WHERE id = ?",
+            (1 if flag else 0, admin_id),
         )
         return cur.rowcount > 0
 
@@ -1893,9 +1931,45 @@ def verify_admin(username, password):
 
 
 def ensure_admin(username, password):
-    """Seed a single owner admin account when the admins table is empty."""
+    """Seed a single owner admin account when the admins table is empty.
+
+    The seeded owner starts with ``must_change_password = 1`` — the very first
+    login forces a password change.
+    """
     with _connect() as conn:
         count = conn.execute("SELECT COUNT(*) AS n FROM admins").fetchone()["n"]
     if count == 0:
-        create_admin(username, password, display_name=username, role="owner")
+        create_admin(username, password, display_name=username, role="owner",
+                     must_change_password=1)
         print(f"[db] Seeded admin account '{username}' (password hashed).")
+
+
+def _flag_default_password_owners(username, password):
+    """Force a password change for owners still using the configured default.
+
+    Newly seeded owners already get the flag from :func:`ensure_admin`; this
+    catches accounts created before this release whose password is still the
+    configured default. Owners who changed their password are left alone.
+    """
+    if not username or not password:
+        return
+    flagged = []
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, username, password_hash FROM admins WHERE role = 'owner'"
+        ).fetchall()
+        for row in rows:
+            try:
+                still_default = check_password_hash(row["password_hash"], password)
+            except (ValueError, TypeError):
+                continue
+            if not still_default:
+                continue
+            conn.execute(
+                "UPDATE admins SET must_change_password = 1 WHERE id = ?",
+                (row["id"],),
+            )
+            flagged.append(row["username"])
+    if flagged:
+        print("[db] must_change_password=1 for owner(s) still using the default "
+              "password: %s" % ", ".join(flagged))
