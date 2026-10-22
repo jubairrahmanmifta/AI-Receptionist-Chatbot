@@ -1,0 +1,67 @@
+{% extends "admin_base.html" %}
+{% block title %}Confirm deactivation{% endblock %}
+{% block heading %}Confirm deactivation{% endblock %}
+{% block style %}
+  .warn-box { background:#fffbeb; border:1px solid #fde68a; color:#92400e;
+              border-radius:12px; padding:16px 18px; margin-bottom:20px;
+              font-size:13.5px; line-height:1.6; }
+  .warn-box b { display:block; margin-bottom:4px; font-size:14px; }
+  .chat-table { width:100%; border-collapse:collapse; }
+  .chat-table th { background:#f9fafb; padding:10px 14px; text-align:left;
+                   font-size:11px; font-weight:700; color:var(--muted);
+                   text-transform:uppercase; letter-spacing:.5px;
+                   border-bottom:1px solid var(--line); }
+  .chat-table td { padding:12px 14px; font-size:13.5px;
+                   border-bottom:1px solid #f3f4f6;
+                   font-family:'Hind Siliguri','Inter',sans-serif; }
+  .chat-table tr:last-child td { border-bottom:none; }
+  .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:20px; }
+  .notes { font-size:12.5px; color:var(--muted); line-height:1.6;
+           margin-top:14px; }
+  .table-wrap { overflow-x:auto; }
+{% endblock %}
+{% block content %}
+  <div class="warn-box">
+    <b>⚠️ This agent still has active chats</b>
+    {{ summary }} Deactivating this account will hand every active chat back to
+    the bot. Nothing has been changed yet.
+  </div>
+
+  <div class="card">
+    <h2>Active chats for {{ target.display_name or target.username }}</h2>
+    <p class="hint">On confirm, each chat below becomes a bot chat, the agent is
+      removed from it, and the customer sees “The assistant is back and can help
+      you again.” (or the Bengali equivalent). This happens in one transaction
+      along with the deactivation.</p>
+    <div class="table-wrap">
+      <table class="chat-table">
+        <thead>
+          <tr><th>Chat</th><th>Language</th><th>Last message</th><th>Last activity</th></tr>
+        </thead>
+        <tbody>
+        {% for chat in chats %}
+          <tr>
+            <td>#{{ chat.id }}</td>
+            <td>{{ chat.lang or '—' }}</td>
+            <td>{{ chat.last_message or '(no messages)' }}</td>
+            <td>{{ chat.last_message_at[:16].replace('T', ' ') if chat.last_message_at else '—' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="notes">
+      The account keeps its chat and audit history. Use Reactivate on the Team
+      page to let it sign in again.
+    </p>
+  </div>
+
+  <form method="POST" action="/admin/confirm-impact">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+    <input type="hidden" name="impact_token" value="{{ token }}"/>
+    <div class="actions">
+      <button class="btn danger" type="submit">Yes, deactivate and return chats to the bot</button>
+      <a class="btn ghost" href="{{ back_url }}">← Go back without changing</a>
+    </div>
+  </form>
+{% endblock %}

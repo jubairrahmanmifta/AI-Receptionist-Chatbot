@@ -171,8 +171,24 @@ CREATE TABLE IF NOT EXISTS admins (
     role                 TEXT DEFAULT 'owner',   -- 'owner' or 'agent'
     is_online            INTEGER DEFAULT 0,
     last_seen            TEXT,
-    must_change_password INTEGER DEFAULT 0       -- 1 = forced to change it first
+    must_change_password INTEGER DEFAULT 0,      -- 1 = forced to change it first
+    active               INTEGER DEFAULT 1,      -- 0 = deactivated (never deleted)
+    session_version      INTEGER DEFAULT 0       -- bumped to end every session
 );
+
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id   INTEGER,
+    actor_name TEXT,
+    action     TEXT,
+    target     TEXT,
+    detail     TEXT,
+    ip         TEXT,
+    created_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_audit_log_created
+    ON admin_audit_log(id);
 
 CREATE TABLE IF NOT EXISTS conversations (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -363,10 +379,32 @@ def _migrate_columns():
             ("last_seen", "ALTER TABLE admins ADD COLUMN last_seen TEXT"),
             ("must_change_password",
              "ALTER TABLE admins ADD COLUMN must_change_password INTEGER DEFAULT 0"),
+            ("active", "ALTER TABLE admins ADD COLUMN active INTEGER DEFAULT 1"),
+            ("session_version",
+             "ALTER TABLE admins ADD COLUMN session_version INTEGER DEFAULT 0"),
         ):
             if col not in admin_cols:
                 conn.execute(ddl)
                 print("[db] Added column admins.%s" % col)
+
+        # Audit trail for team / login / password / canned-reply actions. New
+        # databases get it from SCHEMA; this keeps older ones in step.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS admin_audit_log (
+                   id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                   actor_id   INTEGER,
+                   actor_name TEXT,
+                   action     TEXT,
+                   target     TEXT,
+                   detail     TEXT,
+                   ip         TEXT,
+                   created_at TEXT
+               )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_audit_log_created "
+            "ON admin_audit_log(id)"
+        )
 
         msg_cols = _table_columns(conn, "chat_messages")
         for col, ddl in (
@@ -2054,6 +2092,71 @@ def get_recent_messages(session_id, limit=12):
 
 # ─── ADMINS / AGENTS ──────────────────────────────────────────────────────────
 
+def audit(action, target=None, detail=None):
+    """Write one audit-log row, filling actor + IP from the request context.
+
+    Call this from routes after the action succeeds (or after a blocked login).
+    Never pass passwords, temporary passwords, password hashes or API keys in
+    ``target``/``detail`` — the audit page is readable by every owner.
+    """
+    actor_id = None
+    actor_name = None
+    ip = None
+
+    try:
+        from flask import has_request_context, request, session as flask_session
+        if has_request_context():
+            actor_id = flask_session.get("agent_id") or flask_session.get("admin_id")
+            actor_name = (flask_session.get("agent_display_name")
+                          or flask_session.get("admin_display_name")
+                          or flask_session.get("agent_username")
+                          or flask_session.get("admin_username"))
+            forwarded = (request.headers.get("X-Forwarded-For") or "").strip()
+            ip = (forwarded.split(",")[0].strip() if forwarded
+                  else (request.remote_addr or "unknown"))
+    except Exception:
+        # Auditing must never break the action being audited.
+        actor_id = actor_name = ip = None
+
+    if actor_id and not actor_name:
+        try:
+            row = get_admin_by_id(actor_id) or {}
+            actor_name = row.get("display_name") or row.get("username")
+        except Exception:
+            actor_name = None
+
+    with _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO admin_audit_log
+               (actor_id, actor_name, action, target, detail, ip, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (actor_id, actor_name, str(action or ""), _audit_text(target),
+             _audit_text(detail), ip, _now()),
+        )
+    return cur.lastrowid
+
+
+def _audit_text(value):
+    """Coerce an audit value to short, control-character-free text."""
+    if value is None:
+        return None
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(value))
+    return text[:2000]
+
+
+def list_audit_log(limit=200):
+    """Return the newest audit entries first (used by /admin/audit)."""
+    try:
+        limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        limit = 200
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM admin_audit_log ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return _rows_to_dicts(rows)
+
+
 def list_admins():
     """Return admin accounts (id + username) as dicts."""
     with _connect() as conn:
@@ -2065,8 +2168,52 @@ def list_agents():
     """Return agent/owner accounts (without password hashes)."""
     with _connect() as conn:
         rows = conn.execute(
-            """SELECT id, username, display_name, role, is_online, last_seen
+            """SELECT id, username, display_name, role, is_online, last_seen,
+                      active, session_version, must_change_password
                FROM admins ORDER BY id"""
+        ).fetchall()
+    return _rows_to_dicts(rows)
+
+
+def list_team():
+    """Return every account with its currently active chat count."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT a.id, a.username, a.display_name, a.role, a.is_online,
+                      a.last_seen, a.active, a.session_version,
+                      a.must_change_password,
+                      (SELECT COUNT(*) FROM conversations c
+                        WHERE c.status = 'with_agent' AND c.agent_id = a.id)
+                        AS active_chats
+               FROM admins a
+               ORDER BY (a.role = 'owner') DESC, a.id"""
+        ).fetchall()
+    return _rows_to_dicts(rows)
+
+
+def count_active_owners(exclude_id=None):
+    """Number of active owner accounts (optionally excluding one id)."""
+    query = "SELECT COUNT(*) AS n FROM admins WHERE role = 'owner' AND active = 1"
+    params = []
+    if exclude_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_id)
+    with _connect() as conn:
+        return conn.execute(query, params).fetchone()["n"]
+
+
+def list_active_chats_for_agent(agent_id):
+    """Conversations currently assigned to an agent (with a last preview)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT c.*,
+                      (SELECT content FROM chat_messages m
+                        WHERE m.conversation_id = c.id
+                        ORDER BY m.id DESC LIMIT 1) AS last_message
+               FROM conversations c
+               WHERE c.status = 'with_agent' AND c.agent_id = ?
+               ORDER BY c.last_message_at DESC""",
+            (agent_id,),
         ).fetchall()
     return _rows_to_dicts(rows)
 
@@ -2085,9 +2232,19 @@ def get_admin_by_id(admin_id):
     with _connect() as conn:
         row = conn.execute(
             """SELECT id, username, display_name, role, is_online, last_seen,
-                      must_change_password
+                      must_change_password, active, session_version
                FROM admins WHERE id = ?""",
             (admin_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_admin_case_insensitive(username):
+    """Find an account by username ignoring case (for uniqueness checks)."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM admins WHERE lower(username) = lower(?)",
+            (username,),
         ).fetchone()
     return dict(row) if row else None
 
@@ -2141,6 +2298,99 @@ def set_must_change_password(admin_id, flag=True):
         return cur.rowcount > 0
 
 
+def reset_admin_password(admin_id, password):
+    """Hash a new password, force a change and end every existing session.
+
+    Returns True when a row was updated. The plaintext password is never stored
+    here beyond the caller's local variable.
+    """
+    with _connect() as conn:
+        cur = conn.execute(
+            """UPDATE admins
+                  SET password_hash = ?, must_change_password = 1,
+                      session_version = COALESCE(session_version, 0) + 1
+                WHERE id = ?""",
+            (generate_password_hash(password), admin_id),
+        )
+        return cur.rowcount > 0
+
+
+def change_own_password(admin_id, password):
+    """Set a new password and clear the forced-change flag (keeps this session)."""
+    with _connect() as conn:
+        cur = conn.execute(
+            """UPDATE admins SET password_hash = ?, must_change_password = 0
+                WHERE id = ?""",
+            (generate_password_hash(password), admin_id),
+        )
+        return cur.rowcount > 0
+
+
+def set_admin_role(admin_id, role):
+    """Change an account's role. Returns True when a row was updated."""
+    if role not in ("owner", "agent"):
+        return False
+    with _connect() as conn:
+        cur = conn.execute("UPDATE admins SET role = ? WHERE id = ?",
+                           (role, admin_id))
+        return cur.rowcount > 0
+
+
+def deactivate_admin(admin_id):
+    """Deactivate an account and hand any active chats back to the bot.
+
+    Everything happens in one ``BEGIN IMMEDIATE`` transaction: each
+    ``with_agent`` conversation becomes ``bot`` with a system message, the
+    account's online flag is cleared, its session version is bumped (ending all
+    sessions) and ``active`` is set to 0. Returns the list of conversation ids
+    handed back.
+    """
+    now = _now()
+    handed_back = []
+    with _connect_tx() as conn:
+        rows = conn.execute(
+            """SELECT * FROM conversations
+               WHERE status = 'with_agent' AND agent_id = ?""",
+            (admin_id,),
+        ).fetchall()
+        for conv in rows:
+            conn.execute(
+                """UPDATE conversations
+                      SET status = 'bot', agent_id = NULL, last_message_at = ?
+                    WHERE id = ? AND status = 'with_agent'""",
+                (now, conv["id"]),
+            )
+            _insert_message(
+                conn, conv["id"], conv["session_id"], "system",
+                _msg(conv, *AGENT_BACK_MESSAGE), created_at=now,
+            )
+            handed_back.append(conv["id"])
+        conn.execute(
+            """UPDATE admins
+                  SET active = 0, is_online = 0,
+                      session_version = COALESCE(session_version, 0) + 1
+                WHERE id = ?""",
+            (admin_id,),
+        )
+    return handed_back
+
+
+def reactivate_admin(admin_id):
+    """Make a deactivated account active again. Returns True."""
+    with _connect() as conn:
+        cur = conn.execute("UPDATE admins SET active = 1 WHERE id = ?",
+                           (admin_id,))
+        return cur.rowcount > 0
+
+
+def force_offline_admin(admin_id):
+    """Mark an account offline without touching its last-seen timestamp."""
+    with _connect() as conn:
+        cur = conn.execute("UPDATE admins SET is_online = 0 WHERE id = ?",
+                           (admin_id,))
+        return cur.rowcount > 0
+
+
 def set_agent_status(agent_id, is_online, touch=True):
     """Record an agent's online flag and heartbeat timestamp."""
     now = _now()
@@ -2164,16 +2414,24 @@ def heartbeat(agent_id, is_online=True):
 
 
 def delete_admin(admin_id):
-    """Delete an admin account. Returns True if a row was deleted."""
+    """Delete an admin account. Returns True if a row was deleted.
+
+    Kept for legacy tooling only: the admin panel never deletes accounts, so
+    chat/appointment history always keeps a valid actor.
+    """
     with _connect() as conn:
         cur = conn.execute("DELETE FROM admins WHERE id = ?", (admin_id,))
         return cur.rowcount > 0
 
 
 def verify_admin(username, password):
-    """Return the admin dict when credentials match, else ``None``."""
+    """Return the admin dict when credentials match and the account is active."""
     admin = get_admin(username)
-    if admin and check_password_hash(admin["password_hash"], password):
+    if not admin:
+        return None
+    if not int(admin.get("active", 1) or 0):
+        return None
+    if check_password_hash(admin["password_hash"], password):
         return admin
     return None
 

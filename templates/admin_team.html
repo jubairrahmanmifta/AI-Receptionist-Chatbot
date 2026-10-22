@@ -1,0 +1,219 @@
+{% extends "admin_base.html" %}
+{% block title %}Team{% endblock %}
+{% block heading %}Team{% endblock %}
+{% block style %}
+  .table-card { background:#fff; border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+  .table-hdr { padding:18px 22px; border-bottom:1px solid var(--line); }
+  .table-hdr h2 { font-size:15px; font-weight:700; }
+  .table-hdr p { font-size:13px; color:var(--muted); margin-top:3px; }
+  .table-wrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; min-width:1050px; }
+  thead th { background:#f9fafb; padding:10px 12px; text-align:left; font-size:10.5px;
+             font-weight:700; color:var(--muted); text-transform:uppercase;
+             letter-spacing:.5px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  tbody tr { border-bottom:1px solid #f3f4f6; vertical-align:top; }
+  tbody tr:last-child { border-bottom:none; }
+  td { padding:12px; font-size:13px; }
+  .u-name { font-weight:700; }
+  .u-user { color:var(--muted); font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+            font-size:12px; }
+  .badge.owner { background:#eef2ff; color:#3730a3; }
+  .badge.agent { background:#f0fdf4; color:#15803d; }
+  .badge.online { background:#f0fdf4; color:#15803d; }
+  .badge.offline { background:#f3f4f6; color:#6b7280; }
+  .badge.warn { background:#fffbeb; color:#92400e; }
+  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:5px; }
+  .dot.on { background:#16a34a; }
+  .dot.off { background:#9ca3af; }
+  .acts { display:flex; flex-direction:column; gap:6px; min-width:150px; }
+  .acts form { margin:0; }
+  .inline-form { display:flex; gap:6px; align-items:center; margin-top:5px; }
+  .inline-form .inp { padding:6px 8px; font-size:12.5px; }
+  .inline-form .btn { padding:6px 10px; font-size:12px; white-space:nowrap; }
+  .btn.warn { background:#b45309; }
+  .btn.warn:hover { background:#92400e; }
+  .btn.ok { background:#15803d; }
+  .btn.ok:hover { background:#166534; }
+  .muted { color:var(--muted); font-size:12px; }
+  .secret-box { background:#fffbeb; border:2px solid #f59e0b; border-radius:12px;
+                padding:18px 20px; margin-bottom:20px; }
+  .secret-box h2 { font-size:15px; color:#92400e; margin-bottom:6px; }
+  .secret-box p { font-size:13px; color:#92400e; line-height:1.55; margin-bottom:12px; }
+  .secret-row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .secret-val { font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+                background:#fff; border:1px solid #fcd34d; border-radius:8px;
+                padding:9px 12px; font-size:15px; font-weight:700; letter-spacing:.4px; }
+  .field-note { font-size:11.5px; color:var(--muted); margin-top:3px; }
+  details summary { cursor:pointer; color:var(--brand); font-size:12px; font-weight:600; }
+  .checks { font-size:12px; color:var(--muted); line-height:1.5; margin-top:6px; }
+  @media (max-width:760px) { .grid2 { grid-template-columns:1fr; } }
+{% endblock %}
+{% block content %}
+  {% if new_credentials %}
+  <div class="secret-box" role="status">
+    <h2>⚠️ Temporary password — shown once</h2>
+    <p>
+      Save this password now and give it to <b>{{ new_credentials.display_name }}</b>
+      (<code>{{ new_credentials.username }}</code>, {{ new_credentials.role }}).
+      It <b>cannot be shown again</b>, is stored only as a hash, and must be
+      changed at their first sign-in. It is not in the audit log or in any log file.
+    </p>
+    <div class="secret-row">
+      <span class="secret-val">{{ new_credentials.password }}</span>
+      <span class="muted">Temporary password</span>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <h2>Add a user</h2>
+    <p class="hint">Creates an owner or agent account. A random temporary
+      password is generated and shown once on this page; the account must
+      change it at first sign-in.</p>
+    {% if errors %}
+    <div class="err-list"><ul>
+      {% for error in errors %}<li>{{ error }}</li>{% endfor %}
+    </ul></div>
+    {% endif %}
+    <form method="POST" action="/admin/team/new">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+      <div class="grid3">
+        <div class="field">
+          <label class="f" for="new-username">Username</label>
+          <input class="inp" id="new-username" name="username"
+                 value="{{ form.username }}" maxlength="30" required
+                 pattern="[a-z0-9._-]{3,30}" autocomplete="off"/>
+          <div class="field-note">3–30 chars: lowercase letters, digits, . _ -</div>
+        </div>
+        <div class="field">
+          <label class="f" for="new-display">Display name</label>
+          <input class="inp" id="new-display" name="display_name"
+                 value="{{ form.display_name }}" maxlength="40" required/>
+          <div class="field-note">1–40 chars, no URLs or HTML.</div>
+        </div>
+        <div class="field">
+          <label class="f" for="new-role">Role</label>
+          <select class="inp" id="new-role" name="role">
+            <option value="agent" {{ 'selected' if form.role != 'owner' }}>Agent — agent console only</option>
+            <option value="owner" {{ 'selected' if form.role == 'owner' }}>Owner — admin panel + console</option>
+          </select>
+        </div>
+      </div>
+      <button class="btn" type="submit">＋ Add user and generate password</button>
+    </form>
+  </div>
+
+  <div class="table-card">
+    <div class="table-hdr">
+      <h2>👥 Accounts</h2>
+      <p>{{ rows | length }} account{{ 's' if rows | length != 1 }}.
+        Accounts are never deleted — deactivate them to keep history intact.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Display name</th><th>Username</th><th>Role</th><th>Status</th>
+            <th>Online</th><th>Last seen</th><th>Active chats</th>
+            <th>Password</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for row in rows %}
+          <tr>
+            <td>
+              <div class="u-name">{{ row.display_name or row.username }}</div>
+              <details>
+                <summary>Edit name</summary>
+                <form class="inline-form" method="POST"
+                      action="/admin/team/{{ row.id }}/name">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+                  <input class="inp" name="display_name" maxlength="40" required
+                         value="{{ row.display_name or row.username }}"
+                         aria-label="Display name for {{ row.username }}"/>
+                  <button class="btn sm" type="submit">Save</button>
+                </form>
+              </details>
+            </td>
+            <td><span class="u-user">{{ row.username }}</span></td>
+            <td>
+              <span class="badge {{ 'owner' if row.role == 'owner' else 'agent' }}">{{ row.role }}</span>
+              <details>
+                <summary>Change role</summary>
+                <form class="inline-form" method="POST"
+                      action="/admin/team/{{ row.id }}/role">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+                  <select class="inp" name="role" aria-label="Role for {{ row.username }}">
+                    <option value="agent" {{ 'selected' if row.role == 'agent' }}>agent</option>
+                    <option value="owner" {{ 'selected' if row.role == 'owner' }}>owner</option>
+                  </select>
+                  <button class="btn sm" type="submit">Save</button>
+                </form>
+              </details>
+            </td>
+            <td>
+              {% if row.active %}
+                <span class="badge online">active</span>
+              {% else %}
+                <span class="badge offline">inactive</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.online %}
+                <span class="badge online"><span class="dot on"></span>online</span>
+              {% else %}
+                <span class="badge offline"><span class="dot off"></span>offline</span>
+              {% endif %}
+            </td>
+            <td class="muted">
+              {{ row.last_seen[:16].replace('T', ' ') if row.last_seen else '—' }}
+            </td>
+            <td>
+              {% if row.active_chats %}
+                <span class="badge owner">{{ row.active_chats }} chat{{ 's' if row.active_chats != 1 }}</span>
+              {% else %}
+                <span class="muted">0</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.must_change_password %}
+                <span class="badge warn">must change</span>
+              {% else %}
+                <span class="muted">set</span>
+              {% endif %}
+            </td>
+            <td>
+              <div class="acts">
+                <form method="POST" action="/admin/team/{{ row.id }}/toggle">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+                  {% if row.active %}
+                    <button class="btn sm danger" type="submit">Deactivate</button>
+                  {% else %}
+                    <button class="btn sm ok" type="submit">Reactivate</button>
+                  {% endif %}
+                </form>
+                <form method="POST" action="/admin/team/{{ row.id }}/reset-password">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+                  <button class="btn sm ghost" type="submit">Reset password</button>
+                </form>
+                {% if row.is_online %}
+                <form method="POST" action="/admin/team/{{ row.id }}/force-offline">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+                  <button class="btn sm warn" type="submit">Force offline</button>
+                </form>
+                {% endif %}
+              </div>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="checks">
+      <b>Guards:</b> you can't deactivate, demote or force-offline yourself, and
+      the last active owner can never be deactivated or demoted. Deactivating an
+      agent with active chats asks for confirmation first; on confirm every chat
+      goes back to the bot with a system message.
+    </div>
+  </div>
+{% endblock %}

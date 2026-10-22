@@ -1,0 +1,325 @@
+{% extends "admin_base.html" %}
+{% block title %}Canned replies{% endblock %}
+{% block heading %}Canned replies{% endblock %}
+{% block style %}
+  .lang-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; align-items:start; }
+  .reply-card { background:#fff; border:1px solid var(--line); border-radius:14px;
+                padding:18px; }
+  .reply-card h3 { display:flex; align-items:center; gap:8px; font-size:13px;
+                   font-weight:700; color:#374151; text-transform:uppercase;
+                   letter-spacing:.5px; margin-bottom:4px; }
+  .reply-card .counter { margin-left:auto; font-size:11.5px; font-weight:600;
+                         color:var(--muted); text-transform:none; letter-spacing:0; }
+  .reply-card .lead { font-size:12px; color:var(--muted); line-height:1.5;
+                      margin-bottom:14px; }
+  .reply-list { display:flex; flex-direction:column; gap:12px; margin-bottom:14px; }
+  .reply-row { border:1px solid var(--line); border-radius:10px; padding:10px;
+               background:#fbfcff; }
+  .reply-row textarea { width:100%; min-height:64px; resize:vertical; padding:8px 10px;
+                        border:1.5px solid var(--line); border-radius:8px;
+                        font-size:13.5px; font-family:inherit; line-height:1.5;
+                        outline:none; }
+  .reply-row textarea:focus { border-color:var(--brand); }
+  .reply-meta { display:flex; align-items:center; gap:8px; margin-top:6px;
+                flex-wrap:wrap; }
+  .reply-meta .len { font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .reply-meta .preview { flex:1; min-width:140px; font-size:11.5px; color:#4b5563;
+                         background:#eef2ff; border-radius:6px; padding:3px 8px;
+                         overflow-wrap:anywhere; }
+  .reply-meta .preview b { color:#3730a3; font-weight:600; }
+  .reply-tools { display:flex; gap:5px; margin-left:auto; }
+  .mini { padding:4px 9px; font-size:11.5px; font-weight:600; border-radius:6px;
+          cursor:pointer; border:1px solid var(--line); background:#fff;
+          color:var(--muted); font-family:inherit; }
+  .mini:hover { border-color:var(--brand); color:var(--brand); }
+  .mini.del:hover { border-color:var(--danger); color:var(--danger); }
+  .mini:disabled { opacity:.35; cursor:not-allowed; }
+  .mini:disabled:hover { border-color:var(--line); color:var(--muted); }
+  .empty { text-align:center; color:#9ca3af; font-size:12.5px; padding:18px 8px;
+           border:1px dashed var(--line); border-radius:9px; margin-bottom:14px; }
+  .save-bar { display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+              margin-top:20px; padding-top:18px; border-top:1px solid var(--line); }
+  .save-bar .help { margin:0; }
+  .client-errors { display:none; background:#fef2f2; border:1px solid #fecaca;
+                   color:#b91c1c; border-radius:10px; padding:12px 16px;
+                   font-size:13px; line-height:1.7; margin-bottom:16px; }
+  .client-errors ul { margin-left:18px; }
+  @media (max-width:900px) { .lang-grid { grid-template-columns:1fr; } }
+{% endblock %}
+{% block content %}
+  <div class="card">
+    <h2>💬 Quick replies for the agent console</h2>
+    <p class="hint">
+      Agents pick these from the “Canned replies…” menu while chatting. Add,
+      edit, reorder or delete them below, then save once. Use
+      <code>{agent_name}</code> and <code>{clinic_name}</code> — they are filled
+      in for the signed-in agent and the active language. Any other braces are
+      left exactly as typed.
+    </p>
+
+    {% if errors %}
+    <div class="err-list"><ul>
+      {% for error in errors %}<li>{{ error }}</li>{% endfor %}
+    </ul></div>
+    {% endif %}
+
+    <div class="client-errors" id="client-errors" role="alert">
+      <b>Please fix these before saving:</b>
+      <ul id="client-error-list"></ul>
+    </div>
+
+    <form method="POST" action="{{ url_for('admin_canned') }}" id="canned-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+      <input type="hidden" name="canned_en" id="canned_en"
+             value="{{ values.en | tojson }}"/>
+      <input type="hidden" name="canned_bn" id="canned_bn"
+             value="{{ values.bn | tojson }}"/>
+
+      <div class="lang-grid">
+        <section class="reply-card" data-lang="en">
+          <h3>English <span class="counter" id="count-en">0 / {{ max_replies }}</span></h3>
+          <p class="lead">Shown to customers chatting in English.</p>
+          <div class="reply-list" id="list-en"></div>
+          <button class="btn ghost sm" type="button" onclick="addReply('en')">
+            ＋ Add English reply
+          </button>
+        </section>
+
+        <section class="reply-card" data-lang="bn">
+          <h3>বাংলা <span class="counter" id="count-bn">0 / {{ max_replies }}</span></h3>
+          <p class="lead">Shown to customers chatting in Bengali.</p>
+          <div class="reply-list" id="list-bn"></div>
+          <button class="btn ghost sm" type="button" onclick="addReply('bn')">
+            ＋ Add Bengali reply
+          </button>
+        </section>
+      </div>
+
+      <div class="save-bar">
+        <button class="btn" type="submit">Save canned replies</button>
+        <span class="help">
+          Up to {{ max_replies }} replies per language, {{ max_len }} characters
+          each. Blank lines, duplicates (ignoring case) and control characters
+          are rejected.
+        </span>
+      </div>
+    </form>
+  </div>
+{% endblock %}
+{% block page_js %}
+<script>
+(function () {
+  "use strict";
+
+  var MAX_REPLIES = {{ max_replies | tojson }};
+  var MAX_LEN = {{ max_len | tojson }};
+  var AGENT = {{ preview_agent | tojson }};
+  var CLINIC = {
+    en: {{ clinic_en | tojson }},
+    bn: {{ clinic_bn | tojson }}
+  };
+  var initial = {{ values | tojson }};
+  var CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+
+  var state = {
+    en: (Array.isArray(initial.en) ? initial.en.slice() : []),
+    bn: (Array.isArray(initial.bn) ? initial.bn.slice() : [])
+  };
+
+  function clean(value) {
+    return String(value == null ? "" : value).replace(CONTROL, "").trim();
+  }
+
+  function substitute(text, lang) {
+    return String(text == null ? "" : text)
+      .replace(/\{agent_name\}/g, AGENT || "")
+      .replace(/\{clinic_name\}/g, CLINIC[lang] || "");
+  }
+
+  function showErrors(messages) {
+    var box = document.getElementById("client-errors");
+    var list = document.getElementById("client-error-list");
+    while (list.firstChild) list.removeChild(list.firstChild);
+    if (!messages.length) {
+      box.style.display = "none";
+      return;
+    }
+    messages.forEach(function (message) {
+      var li = document.createElement("li");
+      li.textContent = message;
+      list.appendChild(li);
+    });
+    box.style.display = "block";
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function updateCount(lang) {
+    var counter = document.getElementById("count-" + lang);
+    counter.textContent = state[lang].length + " / " + MAX_REPLIES;
+  }
+
+  function addReply(lang) {
+    if (state[lang].length >= MAX_REPLIES) {
+      showErrors(["Maximum " + MAX_REPLIES + " replies per language."]);
+      return;
+    }
+    state[lang].push("");
+    render(lang);
+    var rows = document.querySelectorAll("#list-" + lang + " textarea");
+    if (rows.length) rows[rows.length - 1].focus();
+  }
+
+  function moveReply(lang, index, direction) {
+    var target = index + direction;
+    if (target < 0 || target >= state[lang].length) return;
+    var moved = state[lang][index];
+    state[lang][index] = state[lang][target];
+    state[lang][target] = moved;
+    render(lang);
+  }
+
+  function deleteReply(lang, index) {
+    state[lang].splice(index, 1);
+    render(lang);
+  }
+
+  function render(lang) {
+    var list = document.getElementById("list-" + lang);
+    while (list.firstChild) list.removeChild(list.firstChild);
+    updateCount(lang);
+
+    if (!state[lang].length) {
+      var empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "No replies yet — add the first one below.";
+      list.appendChild(empty);
+      return;
+    }
+
+    state[lang].forEach(function (text, index) {
+      var row = document.createElement("div");
+      row.className = "reply-row";
+
+      var label = document.createElement("label");
+      label.className = "f";
+      label.textContent = "Reply " + (index + 1);
+      var textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.maxLength = MAX_LEN;
+      textarea.setAttribute("aria-label", "Reply " + (index + 1) + " (" + lang + ")");
+      label.appendChild(textarea);
+      row.appendChild(label);
+
+      var meta = document.createElement("div");
+      meta.className = "reply-meta";
+
+      var preview = document.createElement("span");
+      preview.className = "preview";
+      var previewLabel = document.createElement("b");
+      previewLabel.textContent = "Preview: ";
+      preview.appendChild(previewLabel);
+      var previewText = document.createTextNode(
+        substitute(clean(text) || "(empty)", lang));
+      preview.appendChild(previewText);
+
+      var len = document.createElement("span");
+      len.className = "len";
+      len.textContent = clean(text).length + " / " + MAX_LEN;
+
+      var tools = document.createElement("span");
+      tools.className = "reply-tools";
+
+      var up = document.createElement("button");
+      up.type = "button";
+      up.className = "mini";
+      up.textContent = "↑";
+      up.title = "Move up";
+      up.disabled = index === 0;
+      up.addEventListener("click", function () { moveReply(lang, index, -1); });
+
+      var down = document.createElement("button");
+      down.type = "button";
+      down.className = "mini";
+      down.textContent = "↓";
+      down.title = "Move down";
+      down.disabled = index === state[lang].length - 1;
+      down.addEventListener("click", function () { moveReply(lang, index, 1); });
+
+      var del = document.createElement("button");
+      del.type = "button";
+      del.className = "mini del";
+      del.textContent = "Delete";
+      del.title = "Delete this reply";
+      del.addEventListener("click", function () { deleteReply(lang, index); });
+
+      tools.appendChild(up);
+      tools.appendChild(down);
+      tools.appendChild(del);
+
+      meta.appendChild(preview);
+      meta.appendChild(len);
+      meta.appendChild(tools);
+      row.appendChild(meta);
+
+      textarea.addEventListener("input", function () {
+        state[lang][index] = textarea.value;
+        previewText.nodeValue = substitute(clean(textarea.value) || "(empty)", lang);
+        len.textContent = clean(textarea.value).length + " / " + MAX_LEN;
+      });
+
+      list.appendChild(row);
+    });
+  }
+
+  function validate() {
+    var messages = [];
+    ["en", "bn"].forEach(function (lang) {
+      var label = lang === "en" ? "English" : "Bengali";
+      var cleaned = [];
+      var seen = {};
+      state[lang].forEach(function (raw, index) {
+        var text = clean(raw);
+        if (!text) {
+          messages.push(label + " reply " + (index + 1) + " can't be empty.");
+          return;
+        }
+        if (text.length > MAX_LEN) {
+          messages.push(label + " reply " + (index + 1) + " is longer than "
+                        + MAX_LEN + " characters.");
+          return;
+        }
+        var key = text.toLowerCase();
+        if (Object.prototype.hasOwnProperty.call(seen, key)) {
+          messages.push(label + " reply " + (index + 1) + " is a duplicate.");
+          return;
+        }
+        seen[key] = true;
+        cleaned.push(text);
+      });
+      if (state[lang].length > MAX_REPLIES) {
+        messages.push(label + " can have at most " + MAX_REPLIES + " replies.");
+      }
+      state[lang] = cleaned;
+    });
+    return messages;
+  }
+
+  document.getElementById("canned-form").addEventListener("submit", function (event) {
+    var messages = validate();
+    if (messages.length) {
+      event.preventDefault();
+      render("en");
+      render("bn");
+      showErrors(messages);
+      return;
+    }
+    document.getElementById("canned_en").value = JSON.stringify(state.en);
+    document.getElementById("canned_bn").value = JSON.stringify(state.bn);
+    showErrors([]);
+  });
+
+  render("en");
+  render("bn");
+})();
+</script>
+{% endblock %}

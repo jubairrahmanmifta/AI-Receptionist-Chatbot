@@ -984,9 +984,17 @@ def _start_admin_session(admin):
     session["admin_username"] = admin["username"]
     session["admin_display_name"] = (admin.get("display_name")
                                      or admin["username"])
+    session["admin_session_version"] = int(admin.get("session_version") or 0)
     session["last_active"] = time.time()
     session.permanent = True
     _csrf_token()   # a brand-new token after clearing the session
+
+
+def _session_version_matches(admin, session_key):
+    """True when the session's stored version matches the database value."""
+    stored = session.get(session_key)
+    return str(stored if stored is not None else "") == str(
+        int(admin.get("session_version") or 0))
 
 
 def _admin_gate():
@@ -1000,7 +1008,9 @@ def _admin_gate():
         return ("Forbidden — agent accounts cannot open /admin.", 403)
 
     admin = db.get_admin_by_id(session.get("admin_id"))
-    if not admin or admin.get("role") != "owner":
+    if (not admin or admin.get("role") != "owner"
+            or not int(admin.get("active", 1) or 0)
+            or not _session_version_matches(admin, "admin_session_version")):
         session.clear()
         return redirect(url_for("admin_login"))
     if _session_idle_expired():
@@ -1066,6 +1076,8 @@ def admin_login():
         if _login_blocked(ip, username):
             ADMIN_LOGGER.warning("Admin login blocked: username=%r ip=%s",
                                  username, ip)
+            db.audit("login_blocked", target=username,
+                     detail="Admin login blocked after repeated failures.")
             error = ("Too many failed attempts. Please wait a few minutes "
                      "and try again.")
         else:
@@ -1085,6 +1097,8 @@ def admin_login():
                 _login_failure(ip, username)
                 ADMIN_LOGGER.warning("Admin login failed: username=%r ip=%s",
                                      username, ip)
+                db.audit("login_failed", target=username,
+                         detail="Admin login failed (bad credentials or inactive account).")
                 error = "Invalid username or password."
     return render_template("admin_login.html", error=error,
                            next_value=_safe_next(nxt, ""))
@@ -1291,6 +1305,8 @@ def admin_account():
             if not errors:
                 db.update_admin(admin["id"], password=new,
                                 must_change_password=False)
+                db.audit("password_changed", target=admin.get("username"),
+                         detail="Owner changed their own password.")
                 flash("Password updated.", "success")
                 return redirect(url_for("admin_account"))
         else:
@@ -1339,6 +1355,340 @@ def _password_policy_errors(username, new_password, current_password=None):
     if current_password is not None and new_password == current_password:
         errors.append("The new password must be different from the current one.")
     return errors
+
+
+# ─── ADMIN: TEAM ──────────────────────────────────────────────────────────────
+TEAM_USERNAME_RE = re.compile(r"^[a-z0-9._-]{3,30}$")
+TEAM_DISPLAY_MAX = 40
+TEAM_HTML_RE = re.compile(r"[<>]")
+TEAM_URL_RE = re.compile(r"(https?://|www\.)", re.IGNORECASE)
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _temp_password():
+    """A random temporary password (16 chars) from the secrets module."""
+    return secrets.token_urlsafe(12)
+
+
+def _validate_team_display(value):
+    """Validate a display name; returns an error string or ``None``."""
+    display = (value or "").strip()
+    if not display:
+        return "Display name is required."
+    if len(display) > TEAM_DISPLAY_MAX:
+        return ("Display name must be %d characters or fewer."
+                % TEAM_DISPLAY_MAX)
+    if CONTROL_CHARS_RE.search(display):
+        return "Display name can't contain control characters."
+    if TEAM_HTML_RE.search(display):
+        return "Display name can't contain HTML."
+    if TEAM_URL_RE.search(display):
+        return "Display name can't contain a URL."
+    return None
+
+
+def _validate_team_form(form):
+    """Validate the add-user form. Returns ``(values, errors)``."""
+    values = {
+        "username": (form.get("username") or "").strip(),
+        "display_name": (form.get("display_name") or "").strip(),
+        "role": (form.get("role") or "agent").strip(),
+    }
+    errors = []
+    if not TEAM_USERNAME_RE.match(values["username"]):
+        errors.append("Username must be 3–30 characters using only lowercase "
+                      "letters, digits, dots, dashes or underscores.")
+    elif db.get_admin_case_insensitive(values["username"]):
+        errors.append("That username is already taken.")
+    display_error = _validate_team_display(values["display_name"])
+    if display_error:
+        errors.append(display_error)
+    if values["role"] not in ("agent", "owner"):
+        errors.append("Role must be agent or owner.")
+    return values, errors
+
+
+def _team_rows():
+    """Team rows with a computed online indicator (fresh heartbeat only)."""
+    rows = db.list_team()
+    window = db.get_setting_int("agent_online_window_seconds", 45)
+    now = db.dhaka_now()
+    for row in rows:
+        online = False
+        if row.get("is_online") and row.get("last_seen"):
+            try:
+                last = datetime.datetime.fromisoformat(str(row["last_seen"]))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=db.TZ_DHAKA)
+                online = (now - last).total_seconds() <= window
+            except (TypeError, ValueError):
+                online = False
+        row["online"] = online
+        row["active"] = int(row.get("active", 1) or 0)
+        row["active_chats"] = int(row.get("active_chats") or 0)
+    return rows
+
+
+def _render_team(**overrides):
+    context = {
+        "nav": "team",
+        "rows": _team_rows(),
+        "errors": [],
+        "form": {"username": "", "display_name": "", "role": "agent"},
+        "new_credentials": None,
+    }
+    context.update(overrides)
+    return render_template("admin_team.html", **context)
+
+
+@app.route("/admin/team")
+@owner_required
+def admin_team():
+    return _render_team()
+
+
+@app.route("/admin/team/new", methods=["POST"])
+@owner_required
+def admin_team_new():
+    values, errors = _validate_team_form(request.form)
+    if errors:
+        return _render_team(errors=errors, form=values), 200
+
+    temp_password = _temp_password()
+    db.create_admin(values["username"], temp_password,
+                    display_name=values["display_name"], role=values["role"],
+                    must_change_password=1)
+    db.audit("team_added", target=values["username"],
+             detail="Added %s (%s); temporary password issued."
+                    % (values["display_name"], values["role"]))
+    return _render_team(new_credentials={
+        "username": values["username"],
+        "display_name": values["display_name"],
+        "role": values["role"],
+        "password": temp_password,
+    })
+
+
+@app.route("/admin/team/<int:admin_id>/name", methods=["POST"])
+@owner_required
+def admin_team_name(admin_id):
+    target = db.get_admin_by_id(admin_id)
+    if not target:
+        flash("That user no longer exists.", "error")
+        return redirect(url_for("admin_team"))
+    display = (request.form.get("display_name") or "").strip()
+    error = _validate_team_display(display)
+    if error:
+        flash(error, "error")
+        return redirect(url_for("admin_team"))
+    db.update_admin(admin_id, display_name=display)
+    if admin_id == session.get("admin_id"):
+        session["admin_display_name"] = display
+    db.audit("team_display_name", target=target["username"],
+             detail="Display name changed to %s." % display)
+    flash("Display name updated for %s." % target["username"], "success")
+    return redirect(url_for("admin_team"))
+
+
+@app.route("/admin/team/<int:admin_id>/role", methods=["POST"])
+@owner_required
+def admin_team_role(admin_id):
+    target = db.get_admin_by_id(admin_id)
+    if not target:
+        flash("That user no longer exists.", "error")
+        return redirect(url_for("admin_team"))
+    role = (request.form.get("role") or "").strip()
+    if role not in ("agent", "owner"):
+        flash("Role must be agent or owner.", "error")
+        return redirect(url_for("admin_team"))
+    if admin_id == session.get("admin_id") and role != "owner":
+        flash("You can't change your own owner role — ask another owner.", "error")
+        return redirect(url_for("admin_team"))
+    if (target.get("role") == "owner" and int(target.get("active", 1) or 0)
+            and role != "owner"
+            and db.count_active_owners(exclude_id=admin_id) == 0):
+        flash("The last active owner can't be demoted.", "error")
+        return redirect(url_for("admin_team"))
+    if target.get("role") == role:
+        flash("%s already has the %s role." % (target["username"], role),
+              "notice")
+        return redirect(url_for("admin_team"))
+    db.set_admin_role(admin_id, role)
+    db.audit("team_role", target=target["username"],
+             detail="Role changed from %s to %s."
+                    % (target.get("role"), role))
+    flash("%s is now %s." % (target["username"], role), "success")
+    return redirect(url_for("admin_team"))
+
+
+@app.route("/admin/team/<int:admin_id>/toggle", methods=["POST"])
+@owner_required
+def admin_team_toggle(admin_id):
+    target = db.get_admin_by_id(admin_id)
+    if not target:
+        flash("That user no longer exists.", "error")
+        return redirect(url_for("admin_team"))
+
+    is_active = bool(int(target.get("active", 1) or 0))
+    if not is_active:
+        db.reactivate_admin(admin_id)
+        db.audit("team_reactivated", target=target["username"],
+                 detail="Account reactivated.")
+        flash("%s can sign in again." % target["username"], "success")
+        return redirect(url_for("admin_team"))
+
+    if admin_id == session.get("admin_id"):
+        flash("You can't deactivate your own account.", "error")
+        return redirect(url_for("admin_team"))
+    if (target.get("role") == "owner"
+            and db.count_active_owners(exclude_id=admin_id) == 0):
+        flash("The last active owner can't be deactivated.", "error")
+        return redirect(url_for("admin_team"))
+
+    chats = db.list_active_chats_for_agent(admin_id)
+    if chats:
+        return render_template(
+            "admin_confirm_team.html", nav="team", target=target,
+            chats=chats, back_url=url_for("admin_team"),
+            token=_impact_token({"kind": "deactivate_admin",
+                                 "admin_id": admin_id}),
+            summary="%s has %d active chat%s."
+                    % (target["display_name"] or target["username"],
+                       len(chats), "s" if len(chats) != 1 else ""))
+
+    handed_back = db.deactivate_admin(admin_id)
+    db.audit("team_deactivated", target=target["username"],
+             detail="Account deactivated; %d active chat(s) handed back to the bot."
+                    % len(handed_back))
+    flash("%s was deactivated. All their sessions have ended." % target["username"],
+          "success")
+    return redirect(url_for("admin_team"))
+
+
+@app.route("/admin/team/<int:admin_id>/reset-password", methods=["POST"])
+@owner_required
+def admin_team_reset_password(admin_id):
+    target = db.get_admin_by_id(admin_id)
+    if not target:
+        flash("That user no longer exists.", "error")
+        return redirect(url_for("admin_team"))
+    temp_password = _temp_password()
+    db.reset_admin_password(admin_id, temp_password)
+    db.audit("team_password_reset", target=target["username"],
+             detail="Temporary password issued; all sessions ended.")
+    return _render_team(new_credentials={
+        "username": target["username"],
+        "display_name": target.get("display_name") or target["username"],
+        "role": target.get("role"),
+        "password": temp_password,
+    })
+
+
+@app.route("/admin/team/<int:admin_id>/force-offline", methods=["POST"])
+@owner_required
+def admin_team_force_offline(admin_id):
+    target = db.get_admin_by_id(admin_id)
+    if not target:
+        flash("That user no longer exists.", "error")
+        return redirect(url_for("admin_team"))
+    if admin_id == session.get("admin_id"):
+        flash("You can't force-offline your own account.", "error")
+        return redirect(url_for("admin_team"))
+    db.force_offline_admin(admin_id)
+    db.audit("team_force_offline", target=target["username"],
+             detail="Signed out of the agent queue (forced offline).")
+    flash("%s is now offline." % target["username"], "success")
+    return redirect(url_for("admin_team"))
+
+
+# ─── ADMIN: AUDIT LOG ─────────────────────────────────────────────────────────
+@app.route("/admin/audit")
+@owner_required
+def admin_audit():
+    return render_template("admin_audit.html", nav="audit",
+                           entries=db.list_audit_log(200))
+
+
+# ─── ADMIN: CANNED REPLIES ────────────────────────────────────────────────────
+CANNED_MAX_REPLIES = 20
+CANNED_MAX_LEN = 300
+
+
+def _parse_canned_json(raw, label):
+    """Parse + validate one language's JSON list. Returns ``(list, errors)``."""
+    errors = []
+    if raw is None or not str(raw).strip():
+        return [], errors
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return [], ["%s replies must be valid JSON." % label]
+    if not isinstance(data, list):
+        return [], ["%s replies must be a JSON list." % label]
+    if len(data) > CANNED_MAX_REPLIES:
+        errors.append("%s can have at most %d replies."
+                      % (label, CANNED_MAX_REPLIES))
+    cleaned = []
+    seen = set()
+    for index, item in enumerate(data, start=1):
+        if not isinstance(item, str):
+            errors.append("%s reply %d must be text." % (label, index))
+            continue
+        text = CONTROL_CHARS_RE.sub("", item).strip()
+        if not text:
+            errors.append("%s reply %d can't be empty." % (label, index))
+            continue
+        if len(text) > CANNED_MAX_LEN:
+            errors.append("%s reply %d is longer than %d characters."
+                          % (label, index, CANNED_MAX_LEN))
+            continue
+        key = text.casefold()
+        if key in seen:
+            errors.append("%s reply %d is a duplicate." % (label, index))
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return cleaned, errors
+
+
+def _render_canned(values=None, errors=None):
+    settings = db.get_settings()
+    if values is None:
+        values = {
+            "en": db.get_canned_replies("en"),
+            "bn": db.get_canned_replies("bn"),
+        }
+    return render_template(
+        "admin_canned.html", nav="canned", values=values, errors=errors or [],
+        max_replies=CANNED_MAX_REPLIES, max_len=CANNED_MAX_LEN,
+        clinic_en=(settings.get("clinic_name")
+                   or settings.get("clinic_name_bn") or "the clinic"),
+        clinic_bn=(settings.get("clinic_name_bn")
+                   or settings.get("clinic_name") or "ক্লিনিক"),
+        preview_agent=session.get("admin_display_name")
+                       or session.get("admin_username") or "Riya")
+
+
+@app.route("/admin/canned", methods=["GET", "POST"])
+@owner_required
+def admin_canned():
+    if request.method == "POST":
+        raw_en = request.form.get("canned_en", "[]")
+        raw_bn = request.form.get("canned_bn", "[]")
+        en, en_errors = _parse_canned_json(raw_en, "English")
+        bn, bn_errors = _parse_canned_json(raw_bn, "Bengali")
+        errors = en_errors + bn_errors
+        if errors:
+            return _render_canned(values={"en": en, "bn": bn}, errors=errors)
+        db.set_canned_replies("en", en)
+        db.set_canned_replies("bn", bn)
+        db.audit("canned_replies_saved", target="en, bn",
+                 detail="Saved %d English and %d Bengali replies."
+                        % (len(en), len(bn)))
+        flash("Canned replies saved — the agent console uses them immediately.",
+              "success")
+        return redirect(url_for("admin_canned"))
+    return _render_canned()
 
 
 # ─── ADMIN: CATALOG (doctors, days off, services) ──────────────────────────────
@@ -2111,27 +2461,70 @@ def admin_confirm_impact():
             flash("Doctor disabled. The listed appointments were left "
                   "untouched.", "success")
         return redirect(url_for("admin_doctors"))
+    if kind == "deactivate_admin":
+        admin_id = payload.get("admin_id")
+        target = db.get_admin_by_id(admin_id)
+        if not target:
+            flash("That user no longer exists.", "error")
+            return redirect(url_for("admin_team"))
+        if admin_id == session.get("admin_id"):
+            flash("You can't deactivate your own account.", "error")
+            return redirect(url_for("admin_team"))
+        if (target.get("role") == "owner"
+                and db.count_active_owners(exclude_id=admin_id) == 0):
+            flash("The last active owner can't be deactivated.", "error")
+            return redirect(url_for("admin_team"))
+        handed_back = db.deactivate_admin(admin_id)
+        db.audit("team_deactivated", target=target["username"],
+                 detail="Account deactivated; %d active chat(s) handed back "
+                        "to the bot." % len(handed_back))
+        flash("%s was deactivated and their active chats went back to the bot."
+              % target["username"], "success")
+        return redirect(url_for("admin_team"))
     flash("Nothing was changed.", "error")
     return redirect(url_for("admin_doctors"))
 
 
 # ─── ROUTES — AGENT (login + JSON API) ────────────────────────────────────────
+def _agent_session_admin():
+    """Return the signed-in agent when its session is still valid, else None.
+
+    Clears the session when the account was deleted, deactivated or its
+    ``session_version`` was bumped (password reset / forced sign-out).
+    """
+    agent_id = session.get("agent_id")
+    if not agent_id:
+        return None
+    admin = db.get_admin_by_id(agent_id)
+    if (not admin or not int(admin.get("active", 1) or 0)
+            or not _session_version_matches(admin, "agent_session_version")):
+        session.clear()
+        return None
+    return admin
+
+
 def agent_login_required(f):
-    """Require a logged-in agent (or owner) for JSON agent endpoints."""
+    """Require a valid, active agent session for JSON agent endpoints."""
     @functools.wraps(f)
     def decorated(*args, **kwargs):
-        if not session.get("agent_id"):
+        admin = _agent_session_admin()
+        if admin is None:
             return jsonify({"error": "unauthorized"}), 401
+        if admin.get("must_change_password"):
+            return jsonify({"error": "must_change_password"}), 403
         return f(*args, **kwargs)
     return decorated
 
 
 def agent_post_required(f):
-    """Require a logged-in agent AND a valid CSRF token for state changes."""
+    """Require a valid agent session AND a CSRF token for state changes."""
     @functools.wraps(f)
     def decorated(*args, **kwargs):
-        if not session.get("agent_id"):
+        admin = _agent_session_admin()
+        if admin is None:
             return jsonify({"error": "unauthorized"}), 401
+        if admin.get("must_change_password"):
+            return jsonify({"error": "must_change_password"}), 403
         if not _csrf_ok():
             return jsonify({"error": "csrf"}), 403
         return f(*args, **kwargs)
@@ -2166,26 +2559,43 @@ def _agent_can_act(conv):
     return conv["status"] == "with_agent" and conv["agent_id"] == _agent_id()
 
 
+def _start_agent_session(admin):
+    """Start a clean agent session, storing the account's session version."""
+    session.clear()
+    session["agent_id"] = admin["id"]
+    session["agent_role"] = admin["role"]
+    session["agent_username"] = admin["username"]
+    session["agent_display_name"] = admin.get("display_name") or admin["username"]
+    session["agent_session_version"] = int(admin.get("session_version") or 0)
+    _csrf_token()
+    # Owners can also use the admin area.
+    if admin["role"] == "owner":
+        session["admin_logged_in"] = True
+        session["admin_id"] = admin["id"]
+        session["admin_role"] = "owner"
+        session["admin_username"] = admin["username"]
+        session["admin_display_name"] = (admin.get("display_name")
+                                         or admin["username"])
+        session["admin_session_version"] = int(admin.get("session_version") or 0)
+        session["last_active"] = time.time()
+        session.permanent = True
+
+
 @app.route("/agent/login", methods=["GET", "POST"])
 def agent_login():
     error = None
     if request.method == "POST":
-        username = request.form.get("username", "")
-        password = request.form.get("password", "")
-        admin = db.verify_admin(username, password)
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        admin = db.verify_admin(username, password) if username else None
         if admin and admin.get("role") in ("agent", "owner"):
-            session["agent_id"] = admin["id"]
-            session["agent_role"] = admin["role"]
-            session["agent_username"] = admin["username"]
-            session["agent_display_name"] = admin.get("display_name") or admin["username"]
-            _csrf_token()
-            # Owners can also use the admin area.
-            if admin["role"] == "owner":
-                session["admin_logged_in"] = True
-                session["admin_id"] = admin["id"]
-                session["admin_role"] = "owner"
-                session["admin_username"] = admin["username"]
+            _start_agent_session(admin)
             return redirect(url_for("agent_home"))
+        # Inactive accounts fail exactly like a wrong password.
+        ADMIN_LOGGER.warning("Agent login failed: username=%r ip=%s",
+                             username, _client_ip())
+        db.audit("login_failed", target=username,
+                 detail="Agent login failed (bad credentials or inactive account).")
         error = "Invalid username or password."
     return render_template("agent_login.html", error=error, logged_in=False,
                            display_name=None, csrf_token=_csrf_token())
@@ -2197,17 +2607,53 @@ def agent_logout():
     return redirect(url_for("agent_login"))
 
 
+@app.route("/agent/password", methods=["GET", "POST"])
+def agent_password():
+    """Let an agent change their password — also clears a forced change."""
+    admin = _agent_session_admin()
+    if admin is None:
+        return redirect(url_for("agent_login"))
+
+    errors = []
+    if request.method == "POST":
+        if not _csrf_ok():
+            return ("Missing or invalid security token (CSRF). "
+                    "Reload the page and try again.", 403)
+        current = request.form.get("current_password") or ""
+        new = request.form.get("new_password") or ""
+        confirm = request.form.get("confirm_password") or ""
+        if not db.verify_admin(admin["username"], current):
+            errors.append("Your current password is incorrect.")
+        if new != confirm:
+            errors.append("The two new passwords don't match.")
+        errors.extend(_password_policy_errors(admin["username"], new, current))
+        if not errors:
+            db.change_own_password(admin["id"], new)
+            db.audit("password_changed", target=admin["username"],
+                     detail="Agent changed their own password.")
+            return redirect(url_for("agent_home"))
+
+    return render_template("agent_password.html", errors=errors,
+                           must_change=bool(admin.get("must_change_password")),
+                           username=admin["username"],
+                           display_name=admin.get("display_name")
+                           or admin["username"],
+                           csrf_token=_csrf_token())
+
+
 @app.route("/agent")
 def agent_home():
-    if not session.get("agent_id"):
+    admin = _agent_session_admin()
+    if admin is None:
         return redirect(url_for("agent_login"))
-    admin = db.get_admin_by_id(session.get("agent_id")) or {}
+    if admin.get("must_change_password"):
+        return redirect(url_for("agent_password"))
     return render_template(
         "agent_console.html",
-        display_name=session.get("agent_display_name"),
-        agent_username=session.get("agent_username"),
-        agent_id=session.get("agent_id"),
-        agent_role=session.get("agent_role"),
+        display_name=admin.get("display_name") or admin["username"],
+        agent_username=admin["username"],
+        agent_id=admin["id"],
+        agent_role=admin["role"],
         is_online=bool(admin.get("is_online")),
         persona_name=db.get_setting("persona_name", "Mita"),
         persona_name_bn=db.get_setting("persona_name_bn", "Mita"),
@@ -2336,11 +2782,30 @@ def agent_callback_status(cb_id):
 @app.route("/agent/api/canned")
 @agent_login_required
 def agent_canned():
-    """Return the canned (quick) replies for the composer, per language."""
+    """Return canned (quick) replies with placeholders substituted, per language."""
+    admin = db.get_admin_by_id(_agent_id()) or {}
+    agent_name = admin.get("display_name") or admin.get("username") or "Agent"
+    clinic_en = (db.get_setting("clinic_name")
+                 or db.get_setting("clinic_name_bn") or "the clinic")
+    clinic_bn = (db.get_setting("clinic_name_bn")
+                 or db.get_setting("clinic_name") or "ক্লিনিক")
     return jsonify({
-        "en": db.get_canned_replies("en"),
-        "bn": db.get_canned_replies("bn"),
+        "en": [_substitute_canned(t, agent_name, clinic_en)
+               for t in db.get_canned_replies("en")],
+        "bn": [_substitute_canned(t, agent_name, clinic_bn)
+               for t in db.get_canned_replies("bn")],
     })
+
+
+def _substitute_canned(text, agent_name, clinic_name):
+    """Replace only the supported canned-reply placeholders.
+
+    Unknown braces (``{something_else}``) are deliberately left untouched.
+    """
+    text = str(text or "")
+    return (text.replace("{agent_name}", str(agent_name or ""))
+                .replace("{clinic_name}", str(clinic_name or "")))
+
 
 
 if __name__ == "__main__":

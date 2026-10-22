@@ -1,0 +1,61 @@
+{% extends "admin_base.html" %}
+{% block title %}Audit log{% endblock %}
+{% block heading %}Audit log{% endblock %}
+{% block style %}
+  .table-card { background:#fff; border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+  .table-hdr { padding:18px 22px; border-bottom:1px solid var(--line); }
+  .table-hdr h2 { font-size:15px; font-weight:700; }
+  .table-hdr p { font-size:13px; color:var(--muted); margin-top:3px; }
+  .table-wrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; min-width:860px; }
+  thead th { background:#f9fafb; padding:10px 14px; text-align:left; font-size:10.5px;
+             font-weight:700; color:var(--muted); text-transform:uppercase;
+             letter-spacing:.5px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  tbody tr { border-bottom:1px solid #f3f4f6; vertical-align:top; }
+  tbody tr:last-child { border-bottom:none; }
+  td { padding:11px 14px; font-size:12.5px; line-height:1.5; }
+  .time { color:var(--muted); white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+          font-size:11.5px; }
+  .action { font-weight:700; white-space:nowrap; }
+  .actor { font-weight:600; }
+  .target { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; }
+  .detail { color:#374151; overflow-wrap:anywhere; min-width:260px; }
+  .ip { color:var(--muted); font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+        font-size:11.5px; white-space:nowrap; }
+  .empty { text-align:center; padding:48px 20px; color:#9ca3af; font-size:14px; }
+  .note { font-size:12px; color:var(--muted); line-height:1.6; margin-bottom:16px; }
+{% endblock %}
+{% block content %}
+  <p class="note">
+    Read-only. The latest {{ entries | length }} entr{{ 'y' if entries | length == 1 else 'ies' }}
+    (newest first). Passwords, temporary passwords, hashes and API keys are never
+    written here. Settings, doctor and service edits are not audited yet.
+  </p>
+
+  <div class="table-card">
+    {% if entries %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th>
+            <th>Detail</th><th>IP</th></tr>
+        </thead>
+        <tbody>
+        {% for entry in entries %}
+          <tr>
+            <td class="time">{{ entry.created_at[:19].replace('T', ' ') if entry.created_at else '—' }}</td>
+            <td class="actor">{{ entry.actor_name or '—' }}</td>
+            <td class="action">{{ entry.action or '—' }}</td>
+            <td class="target">{{ entry.target or '—' }}</td>
+            <td class="detail">{{ entry.detail or '—' }}</td>
+            <td class="ip">{{ entry.ip or '—' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="empty">No audit entries yet.</div>
+    {% endif %}
+  </div>
+{% endblock %}
