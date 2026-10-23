@@ -159,9 +159,19 @@ CREATE TABLE IF NOT EXISTS appointments (
     notes        TEXT,
     language     TEXT,
     session_id   TEXT,
+    source       TEXT DEFAULT 'chat',       -- 'chat' or 'manual'
     created_at   TEXT,
     updated_at   TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_appointments_date_time
+    ON appointments(date, time);
+CREATE INDEX IF NOT EXISTS idx_appointments_doctor_date
+    ON appointments(doctor_id, date);
+CREATE INDEX IF NOT EXISTS idx_appointments_status
+    ON appointments(status);
+CREATE INDEX IF NOT EXISTS idx_appointments_phone
+    ON appointments(phone);
 
 CREATE TABLE IF NOT EXISTS admins (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -369,6 +379,33 @@ def _migrate_columns():
         if "session_id" not in appt_cols:
             conn.execute("ALTER TABLE appointments ADD COLUMN session_id TEXT")
             print("[db] Added column appointments.session_id")
+        if "source" not in appt_cols:
+            conn.execute(
+                "ALTER TABLE appointments ADD COLUMN source TEXT DEFAULT 'chat'"
+            )
+            print("[db] Added column appointments.source")
+        # Rows created before ``source`` existed were all chat bookings.
+        conn.execute(
+            "UPDATE appointments SET source = 'chat' "
+            "WHERE source IS NULL OR source = ''"
+        )
+        # Filter/sort indexes for the appointments page (safe to re-run).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_appointments_date_time "
+            "ON appointments(date, time)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_appointments_doctor_date "
+            "ON appointments(doctor_id, date)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_appointments_status "
+            "ON appointments(status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_appointments_phone "
+            "ON appointments(phone)"
+        )
 
         # Human-handoff columns + the forced-password-change flag.
         admin_cols = _table_columns(conn, "admins")
@@ -838,7 +875,7 @@ def format_price(price, price_max=None):
 
 # ─── AVAILABILITY ─────────────────────────────────────────────────────────────
 
-def get_available_slots(doctor_id, date):
+def get_available_slots(doctor_id, date, exclude_appointment_id=None):
     """Return the free ``'HH:MM'`` slots for a doctor on a date (Asia/Dhaka).
 
     Slots come from the doctor's weekly schedule, generated every
@@ -846,6 +883,9 @@ def get_available_slots(doctor_id, date):
     are removed, and when ``date`` is today, slots already in the past are
     removed too. A disabled doctor, or a date inside one of the doctor's
     days-off ranges, has no slots at all.
+
+    ``exclude_appointment_id`` ignores one appointment when checking what is
+    booked — used when an existing appointment is being edited/rescheduled.
     """
     doctor = get_doctor(doctor_id)
     if not doctor:
@@ -871,13 +911,23 @@ def get_available_slots(doctor_id, date):
             t += slot_minutes
 
     with _connect() as conn:
-        booked = {
-            r["time"] for r in conn.execute(
-                """SELECT time FROM appointments
-                   WHERE doctor_id = ? AND date = ? AND status != 'cancelled'""",
-                (doctor_id, date),
-            )
-        }
+        if exclude_appointment_id is None:
+            booked = {
+                r["time"] for r in conn.execute(
+                    """SELECT time FROM appointments
+                       WHERE doctor_id = ? AND date = ? AND status != 'cancelled'""",
+                    (doctor_id, date),
+                )
+            }
+        else:
+            booked = {
+                r["time"] for r in conn.execute(
+                    """SELECT time FROM appointments
+                       WHERE doctor_id = ? AND date = ?
+                         AND status != 'cancelled' AND id != ?""",
+                    (doctor_id, date, exclude_appointment_id),
+                )
+            }
     minutes = [m for m in minutes if _from_minutes(m) not in booked]
 
     now = dhaka_now()
@@ -1286,6 +1336,36 @@ def delete_service(service_id):
 
 # ─── APPOINTMENTS ─────────────────────────────────────────────────────────────
 
+APPOINTMENT_STATUSES = ("pending", "confirmed", "completed", "cancelled", "no_show")
+APPOINTMENT_SOURCES = ("chat", "manual")
+
+# Only these transitions are allowed. completed and no_show are final.
+APPOINTMENT_TRANSITIONS = {
+    "pending":   {"confirmed", "cancelled"},
+    "confirmed": {"completed", "no_show", "cancelled"},
+    "cancelled": {"pending"},
+    "completed": set(),
+    "no_show":   set(),
+}
+
+
+def appointment_is_upcoming(appt, now=None):
+    """True when an appointment's date/time is still in the future (Dhaka)."""
+    if not appt:
+        return False
+    date = str(appt.get("date") or "").strip()
+    time = str(appt.get("time") or "").strip()
+    if not date or not time:
+        return False
+    try:
+        when = datetime.datetime.fromisoformat("%sT%s" % (date, time))
+    except (ValueError, TypeError):
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=TZ_DHAKA)
+    return when > (now or dhaka_now())
+
+
 def list_appointments(status=None, date=None, doctor_id=None):
     """Return appointments (newest first), optionally filtered."""
     query = "SELECT * FROM appointments WHERE 1 = 1"
@@ -1304,6 +1384,47 @@ def list_appointments(status=None, date=None, doctor_id=None):
         return _rows_to_dicts(conn.execute(query, params).fetchall())
 
 
+def list_appointments_filtered(date_from=None, date_to=None, doctor_id=None,
+                               status=None, source=None, q=None):
+    """Return appointments with joined doctor/service names, filtered.
+
+    Sorting and pagination are left to the caller; this returns every match so
+    the same helper can feed both the paginated page and the CSV export.
+    """
+    query = (
+        """SELECT a.*,
+                  d.name_en AS doctor_name_en, d.name_bn AS doctor_name_bn,
+                  d.active  AS doctor_active,
+                  s.name_en AS service_name_en, s.name_bn AS service_name_bn
+             FROM appointments a
+             LEFT JOIN doctors  d ON d.id = a.doctor_id
+             LEFT JOIN services s ON s.id = a.service_id
+            WHERE 1 = 1"""
+    )
+    params = []
+    if date_from:
+        query += " AND a.date >= ?"
+        params.append(date_from)
+    if date_to:
+        query += " AND a.date <= ?"
+        params.append(date_to)
+    if doctor_id:
+        query += " AND a.doctor_id = ?"
+        params.append(doctor_id)
+    if status:
+        query += " AND a.status = ?"
+        params.append(status)
+    if source:
+        query += " AND a.source = ?"
+        params.append(source)
+    if q:
+        query += " AND (a.patient_name LIKE ? OR a.phone LIKE ?)"
+        like = "%" + str(q) + "%"
+        params.extend([like, like])
+    with _connect() as conn:
+        return _rows_to_dicts(conn.execute(query, params).fetchall())
+
+
 def get_appointment(appointment_id):
     """Return one appointment as a dict or ``None``."""
     with _connect() as conn:
@@ -1313,21 +1434,60 @@ def get_appointment(appointment_id):
     return dict(row) if row else None
 
 
+def _appointment_clash(conn, doctor_id, date, time, exclude_id=None):
+    """Return the id of another active booking at this exact slot, else None."""
+    query = (
+        """SELECT id FROM appointments
+            WHERE doctor_id = ? AND date = ? AND time = ?
+              AND status != 'cancelled'"""
+    )
+    params = [doctor_id, date, time]
+    if exclude_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_id)
+    row = conn.execute(query, params).fetchone()
+    return row["id"] if row else None
+
+
 def create_appointment(patient_name=None, phone=None, doctor_id=None, service_id=None,
                        date=None, time=None, status="pending", notes=None,
-                       language=None, session_id=None):
+                       language=None, session_id=None, source="chat"):
     """Create an appointment. Returns the new id."""
     now = _now()
     with _connect() as conn:
         cur = conn.execute(
             """INSERT INTO appointments
                (patient_name, phone, doctor_id, service_id, date, time,
-                status, notes, language, session_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, notes, language, session_id, source, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (patient_name, phone, doctor_id, service_id, date, time,
-             status, notes, language, session_id, now, now),
+             status, notes, language, session_id, source, now, now),
         )
     return cur.lastrowid
+
+
+def create_admin_appointment(patient_name, phone, doctor_id, service_id, date,
+                             time, status="confirmed", notes=None,
+                             language=None, source="manual"):
+    """Atomically insert a manual/admin booking.
+
+    Returns ``(appointment_id, error)``. The exact-slot check runs inside
+    ``BEGIN IMMEDIATE`` so two admins cannot create the same slot at once.
+    """
+    now = _now()
+    with _connect_tx() as conn:
+        if status != "cancelled" and _appointment_clash(
+                conn, doctor_id, date, time):
+            return None, "slot_taken"
+        cur = conn.execute(
+            """INSERT INTO appointments
+               (patient_name, phone, doctor_id, service_id, date, time,
+                status, notes, language, session_id, source, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""",
+            (patient_name, phone, doctor_id, service_id, date, time,
+             status, notes, language, source, now, now),
+        )
+        return cur.lastrowid, None
 
 
 def book_appointment(patient_name, phone, doctor_id, service_id, date, time,
@@ -1340,18 +1500,13 @@ def book_appointment(patient_name, phone, doctor_id, service_id, date, time,
     """
     now = _now()
     with _connect_tx() as conn:
-        clash = conn.execute(
-            """SELECT 1 FROM appointments
-               WHERE doctor_id = ? AND date = ? AND time = ? AND status != 'cancelled'""",
-            (doctor_id, date, time),
-        ).fetchone()
-        if clash:
+        if _appointment_clash(conn, doctor_id, date, time):
             return None
         cur = conn.execute(
             """INSERT INTO appointments
                (patient_name, phone, doctor_id, service_id, date, time,
-                status, notes, language, session_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, notes, language, session_id, source, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'chat', ?, ?)""",
             (patient_name, phone, doctor_id, service_id, date, time,
              "pending", notes, language, session_id, now, now),
         )
@@ -1364,7 +1519,7 @@ def update_appointment(appointment_id, **fields):
     Returns the updated dict or ``None``.
     """
     allowed = {"patient_name", "phone", "doctor_id", "service_id", "date",
-               "time", "status", "notes", "language", "session_id"}
+               "time", "status", "notes", "language", "session_id", "source"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     updates["updated_at"] = _now()
     assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -1374,6 +1529,98 @@ def update_appointment(appointment_id, **fields):
             (*updates.values(), appointment_id),
         )
     return get_appointment(appointment_id)
+
+
+def update_admin_appointment(appointment_id, **fields):
+    """Atomically edit an appointment (including its status).
+
+    Returns ``(updated_row, error)``. Runs inside ``BEGIN IMMEDIATE`` and
+    re-checks the exact doctor/date/time slot with the edited row excluded, so
+    two admins racing for the same slot cannot both win. The status transition
+    rules and the "completed/no_show only after the time" rule are enforced
+    here as well as in the route.
+    """
+    allowed = {"patient_name", "phone", "doctor_id", "service_id", "date",
+               "time", "status", "notes", "language", "source"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    now = _now()
+    with _connect_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE id = ?", (appointment_id,)
+        ).fetchone()
+        if not row:
+            return None, "not_found"
+        old = dict(row)
+        final = dict(old)
+        final.update(updates)
+
+        new_status = final.get("status") or "pending"
+        old_status = old.get("status") or "pending"
+        if new_status not in APPOINTMENT_STATUSES:
+            return None, "invalid_status"
+        if new_status != old_status:
+            if new_status not in APPOINTMENT_TRANSITIONS.get(old_status, set()):
+                return None, "invalid_transition"
+        if new_status in ("completed", "no_show") and appointment_is_upcoming(final):
+            return None, "future"
+
+        if new_status != "cancelled":
+            clash = _appointment_clash(conn, final.get("doctor_id"),
+                                       final.get("date"), final.get("time"),
+                                       exclude_id=appointment_id)
+            if clash:
+                return None, "slot_taken"
+
+        updates["updated_at"] = now
+        assignments = ", ".join(f"{k} = ?" for k in updates)
+        conn.execute(
+            "UPDATE appointments SET %s WHERE id = ?" % assignments,
+            (*updates.values(), appointment_id),
+        )
+        updated = conn.execute(
+            "SELECT * FROM appointments WHERE id = ?", (appointment_id,)
+        ).fetchone()
+        return dict(updated), None
+
+
+def transition_appointment(appointment_id, new_status):
+    """Atomically move an appointment to ``new_status``.
+
+    Returns ``(updated_row, error)`` where error is one of ``not_found``,
+    ``invalid_status``, ``invalid_transition``, ``future`` or ``slot_taken``.
+    Reopening a cancelled appointment only works while its slot is still free.
+    """
+    now = _now()
+    with _connect_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE id = ?", (appointment_id,)
+        ).fetchone()
+        if not row:
+            return None, "not_found"
+        appt = dict(row)
+        current = appt.get("status") or "pending"
+        if new_status not in APPOINTMENT_STATUSES:
+            return None, "invalid_status"
+        if new_status == current:
+            return appt, None
+        if new_status not in APPOINTMENT_TRANSITIONS.get(current, set()):
+            return None, "invalid_transition"
+        if new_status in ("completed", "no_show") and appointment_is_upcoming(appt):
+            return None, "future"
+        if new_status == "pending":
+            clash = _appointment_clash(conn, appt.get("doctor_id"),
+                                       appt.get("date"), appt.get("time"),
+                                       exclude_id=appointment_id)
+            if clash:
+                return None, "slot_taken"
+        conn.execute(
+            "UPDATE appointments SET status = ?, updated_at = ? WHERE id = ?",
+            (new_status, now, appointment_id),
+        )
+        updated = conn.execute(
+            "SELECT * FROM appointments WHERE id = ?", (appointment_id,)
+        ).fetchone()
+        return dict(updated), None
 
 
 def delete_appointment(appointment_id):

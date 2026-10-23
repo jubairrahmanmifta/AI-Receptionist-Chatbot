@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import csv
 import json
 import time
 import hmac
@@ -55,6 +57,17 @@ app.config.update(
 def _apply_cookie_flags():
     """Re-read COOKIE_SECURE per request so it needs no restart (and is testable)."""
     app.config["SESSION_COOKIE_SECURE"] = _env_flag("COOKIE_SECURE")
+
+
+@app.after_request
+def _no_store_private_pages(response):
+    """Never cache admin or agent pages — they show customer data and secrets."""
+    path = request.path or ""
+    if path == "/admin" or path.startswith("/admin/") or \
+            path == "/agent" or path.startswith("/agent/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 
 # Failed admin logins: 5 per (IP, username) pair *or* 20 per IP across all
@@ -501,10 +514,12 @@ def _extract_markers(reply):
     return visible, booking, booking_present, handoff, handoff_present
 
 
-def _validate_booking(payload, lang):
+def _validate_booking(payload, lang, exclude_appointment_id=None):
     """Validate a parsed booking payload.
 
     Returns ``(booking_dict_or_None, error_message_or_None)``.
+    ``exclude_appointment_id`` lets the admin editor re-validate an existing
+    appointment without it counting as its own double booking.
     """
     def err(en, bn):
         return bn if lang == "bn" else en
@@ -551,7 +566,8 @@ def _validate_booking(payload, lang):
                          "তারিখটা অনেক দূরের (আমরা সর্বোচ্চ ৬০ দিন আগে পর্যন্ত নিই)।")
 
     slot = str(payload.get("time") or "").strip()
-    free = db.get_available_slots(doctor_id, date)
+    free = db.get_available_slots(doctor_id, date,
+                                  exclude_appointment_id=exclude_appointment_id)
     if slot not in free:
         # Distinguish "doctor is away" from "that slot is taken" so the bot can
         # explain the real reason and offer alternatives.
@@ -1115,20 +1131,609 @@ def admin_logout():
 @app.route("/admin")
 @owner_required
 def admin_panel():
-    appts = db.list_appointments()
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    return render_template("admin.html", appointments=appts, now_date=today,
-                           nav="appointments")
+    """Alias for the appointments page (the dashboard replaces it later)."""
+    return _render_appointments_page()
+
+
+@app.route("/admin/appointments")
+@owner_required
+def admin_appointments():
+    return _render_appointments_page()
 
 
 @app.route("/admin/delete/<int:appt_id>", methods=["POST"])
 @owner_post_required
 def admin_delete(appt_id):
     if db.delete_appointment(appt_id):
+        db.audit("appointment_deleted", target="#%d" % appt_id,
+                 detail="Appointment deleted from the legacy delete route.")
         flash("Appointment deleted.", "success")
     else:
         flash("That appointment no longer exists.", "error")
     return redirect(url_for("admin_panel"))
+
+
+# ─── ADMIN: APPOINTMENTS ──────────────────────────────────────────────────────
+APPT_PER_PAGE = 20
+APPT_NOTES_MAX = 500
+APPT_QUERY_MAX = 100
+APPT_STATUS_LABELS = {
+    "pending":   "Pending",
+    "confirmed": "Confirmed",
+    "completed": "Completed",
+    "cancelled": "Cancelled",
+    "no_show":   "No show",
+}
+APPT_STATUS_CLASS = {
+    "pending":   "pending",
+    "confirmed": "confirmed",
+    "completed": "completed",
+    "cancelled": "cancelled",
+    "no_show":   "no-show",
+}
+APPT_SOURCE_LABELS = {"chat": "Chat", "manual": "Manual"}
+
+
+def _valid_iso_date(value):
+    try:
+        return datetime.date.fromisoformat(str(value or "").strip()).isoformat()
+    except (ValueError, TypeError):
+        return ""
+
+
+def _appointment_filters():
+    """Read + validate the list filters from the query string.
+
+    Unknown / malformed values are ignored rather than trusted, so a crafted
+    URL cannot break the page or the CSV export.
+    """
+    args = request.args
+    date_from = _valid_iso_date(args.get("date_from"))
+    date_to = _valid_iso_date(args.get("date_to"))
+    doctor_id = ""
+    raw_doctor = (args.get("doctor") or "").strip()
+    if raw_doctor.isdigit():
+        doctor = db.get_doctor(int(raw_doctor))
+        if doctor:
+            doctor_id = str(doctor["id"])
+    status = (args.get("status") or "").strip()
+    if status not in db.APPOINTMENT_STATUSES:
+        status = ""
+    source = (args.get("source") or "").strip()
+    if source not in db.APPOINTMENT_SOURCES:
+        source = ""
+    q = (args.get("q") or "").strip()[:APPT_QUERY_MAX]
+    attention = "1" if (args.get("attention") or "").strip() == "1" else ""
+    sort = "created" if (args.get("sort") or "").strip() == "created" else "date"
+    page = args.get("page", type=int) or 1
+    if page < 1:
+        page = 1
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "doctor": doctor_id,
+        "status": status,
+        "source": source,
+        "q": q,
+        "attention": attention,
+        "sort": sort,
+        "page": page,
+    }
+
+
+def _appointment_query_args(filters, **overrides):
+    """Merge filter values into a query-string dict, dropping empty ones."""
+    data = dict(filters)
+    data.update(overrides)
+    clean = {}
+    for key, value in data.items():
+        if value in (None, "", 0):
+            continue
+        if key == "page" and int(value) == 1:
+            continue
+        if key == "sort" and value == "date":
+            continue
+        clean[key] = value
+    return clean
+
+
+def _appointment_filter_summary(filters):
+    """Short, value-free summary for the export audit entry."""
+    bits = []
+    for key in ("date_from", "date_to", "doctor", "status", "source", "q",
+                "attention", "sort"):
+        value = filters.get(key)
+        if value:
+            bits.append("%s=%s" % (key, value))
+    return ", ".join(bits) if bits else "no filters"
+
+
+def _appointment_attention(appt, doctor_cache, today):
+    """Reasons an upcoming non-cancelled appointment no longer fits.
+
+    A change the owner confirmed earlier can leave a booking outside the
+    doctor's current schedule, off the slot grid, on a day off, or with a
+    disabled doctor. Nothing is auto-cancelled; the list flags it instead.
+    """
+    if (appt.get("status") or "pending") == "cancelled":
+        return []
+    date = str(appt.get("date") or "")
+    if not date or date < today:
+        return []
+    doctor_id = appt.get("doctor_id")
+    if not doctor_id:
+        return []
+    if doctor_id not in doctor_cache:
+        doctor_cache[doctor_id] = db.get_doctor(doctor_id)
+    doctor = doctor_cache[doctor_id]
+    if not doctor:
+        return []
+    reasons = []
+    if not int(doctor.get("active", 1) or 0):
+        reasons.append("doctor is disabled")
+    if db.is_doctor_off(doctor_id, date):
+        reasons.append("doctor is on leave")
+    if not _slot_boundary_ok(doctor_id, doctor, date, appt.get("time")):
+        reasons.append("outside the current schedule")
+    return reasons
+
+
+def _appointment_rows(filters):
+    """All matching rows with the needs-attention flag, sorted for display."""
+    rows = db.list_appointments_filtered(
+        date_from=filters["date_from"] or None,
+        date_to=filters["date_to"] or None,
+        doctor_id=int(filters["doctor"]) if filters["doctor"] else None,
+        status=filters["status"] or None,
+        source=filters["source"] or None,
+        q=filters["q"] or None,
+    )
+    today = db.dhaka_today().isoformat()
+    doctor_cache = {}
+    for row in rows:
+        reasons = _appointment_attention(row, doctor_cache, today)
+        row["attention_reasons"] = reasons
+        row["needs_attention"] = bool(reasons)
+        row["status"] = row.get("status") or "pending"
+    if filters["attention"]:
+        rows = [row for row in rows if row["needs_attention"]]
+    if filters["sort"] == "created":
+        rows.sort(key=lambda r: (r.get("created_at") or "", r["id"]),
+                  reverse=True)
+    else:
+        upcoming = [r for r in rows if (r.get("date") or "") >= today]
+        past = [r for r in rows if (r.get("date") or "") < today]
+        upcoming.sort(key=lambda r: (r.get("date") or "",
+                                     r.get("time") or "", r["id"]))
+        past.sort(key=lambda r: (r.get("date") or "",
+                                 r.get("time") or "", r["id"]), reverse=True)
+        rows = upcoming + past
+    return rows
+
+
+def _render_appointments_page():
+    filters = _appointment_filters()
+    rows = _appointment_rows(filters)
+    total = len(rows)
+    pages = max(1, (total + APPT_PER_PAGE - 1) // APPT_PER_PAGE)
+    page = min(filters["page"], pages)
+    start = (page - 1) * APPT_PER_PAGE
+    page_rows = rows[start:start + APPT_PER_PAGE]
+    filters["page"] = page
+
+    def query_url(**overrides):
+        return url_for("admin_appointments",
+                       **_appointment_query_args(filters, **overrides))
+
+    def export_query_url():
+        return url_for("admin_appointments_export",
+                       **_appointment_query_args(filters))
+
+    return render_template(
+        "admin_appointments.html", nav="appointments",
+        rows=page_rows, total=total, page=page, pages=pages,
+        per_page=APPT_PER_PAGE, filters=filters,
+        query_url=query_url, export_url=export_query_url(),
+        doctors=db.list_doctors(), statuses=db.APPOINTMENT_STATUSES,
+        status_labels=APPT_STATUS_LABELS, status_class=APPT_STATUS_CLASS,
+        source_labels=APPT_SOURCE_LABELS,
+        transcription_count=sum(1 for r in rows if r["needs_attention"]),
+    )
+
+
+def _appointment_form_values(appt=None):
+    appt = appt or {}
+    return {
+        "patient_name": appt.get("patient_name") or "",
+        "phone": appt.get("phone") or "",
+        "doctor_id": str(appt.get("doctor_id") or ""),
+        "service_id": str(appt.get("service_id") or ""),
+        "date": appt.get("date") or "",
+        "time": appt.get("time") or "",
+        "notes": appt.get("notes") or "",
+        "status": appt.get("status") or "pending",
+    }
+
+
+def _appointment_prefill():
+    """Validated query-string prefill for the manual booking form.
+
+    Only an existing active doctor, a sensible date and a slot that is really
+    free are copied into the form; everything else is ignored.
+    """
+    values = _appointment_form_values({"status": "confirmed"})
+    raw_doctor = (request.args.get("doctor") or "").strip()
+    doctor = db.get_doctor(int(raw_doctor)) if raw_doctor.isdigit() else None
+    if not doctor or not int(doctor.get("active", 1) or 0):
+        return values
+    date = _valid_iso_date(request.args.get("date"))
+    today = db.dhaka_today()
+    if not date:
+        return values
+    try:
+        day = datetime.date.fromisoformat(date)
+    except ValueError:
+        return values
+    if day < today or (day - today).days > MAX_DAYS_AHEAD:
+        return values
+    values["doctor_id"] = str(doctor["id"])
+    values["date"] = date
+    raw_time = (request.args.get("time") or "").strip()
+    if TIME_RE.match(raw_time) and raw_time in db.get_available_slots(
+            doctor["id"], date):
+        values["time"] = raw_time
+    return values
+
+
+def _appointment_status_options(current=None):
+    """The current status plus the transitions allowed from it."""
+    current = current or "pending"
+    if current not in db.APPOINTMENT_STATUSES:
+        current = "pending"
+    allowed = db.APPOINTMENT_TRANSITIONS.get(current, set())
+    return [current] + [s for s in db.APPOINTMENT_STATUSES if s in allowed]
+
+
+def _validate_admin_appointment_form(form, exclude_id=None, override=False):
+    """Validate the shared new/edit appointment form.
+
+    Normal saves go through the chatbot's own :func:`_validate_booking` for the
+    doctor, schedule, slot-grid, days-off and double-booking checks. The
+    emergency override skips only the schedule/slot/days-off checks; an exact
+    duplicate is still refused later inside the BEGIN IMMEDIATE transaction.
+    """
+    values = _appointment_form_values()
+    for key in ("patient_name", "phone", "doctor_id", "service_id", "date",
+                "time", "notes", "status"):
+        if key in form:
+            values[key] = (form.get(key) or "").strip()
+    errors = []
+
+    name = values["patient_name"]
+    if not name:
+        errors.append("Patient name is required.")
+    elif len(name) > MAX_NAME_LEN:
+        errors.append("Patient name must be %d characters or fewer." % MAX_NAME_LEN)
+
+    phone = db.normalize_phone(values["phone"])
+    if not phone:
+        errors.append("Phone number is required.")
+    elif not db.is_valid_phone(phone):
+        errors.append("Phone must be a valid Bangladeshi mobile number "
+                      "(e.g. 01712345678).")
+    values["phone"] = phone
+
+    raw_doctor = values["doctor_id"]
+    doctor = None
+    if not raw_doctor.isdigit():
+        errors.append("Please choose a doctor.")
+    else:
+        doctor = db.get_doctor(int(raw_doctor))
+        if not doctor:
+            errors.append("That doctor no longer exists.")
+        elif not int(doctor.get("active", 1) or 0):
+            errors.append("That doctor is disabled — choose an active doctor.")
+
+    service_id = None
+    if values["service_id"]:
+        if not values["service_id"].isdigit():
+            errors.append("Please choose a valid service.")
+        else:
+            service = db.get_service(int(values["service_id"]))
+            if not service:
+                errors.append("That service no longer exists.")
+            else:
+                service_id = service["id"]
+
+    date = _valid_iso_date(values["date"])
+    day = None
+    if not date:
+        errors.append("Please choose a valid date.")
+    else:
+        day = datetime.date.fromisoformat(date)
+        today = db.dhaka_today()
+        if day < today:
+            errors.append("The date is in the past.")
+        elif (day - today).days > MAX_DAYS_AHEAD:
+            errors.append("Appointments can be booked at most %d days ahead."
+                          % MAX_DAYS_AHEAD)
+    values["date"] = date
+
+    time_value = values["time"]
+    if not TIME_RE.match(time_value):
+        errors.append("Please choose a valid time (HH:MM).")
+
+    notes = values["notes"]
+    if len(notes) > APPT_NOTES_MAX:
+        errors.append("Notes must be %d characters or fewer." % APPT_NOTES_MAX)
+
+    status = values["status"] or "pending"
+    if status not in db.APPOINTMENT_STATUSES:
+        errors.append("Please choose a valid status.")
+    elif status in ("completed", "no_show"):
+        candidate = {"date": date, "time": time_value}
+        if db.appointment_is_upcoming(candidate):
+            errors.append("Completed and no-show can only be set once the "
+                          "appointment time has passed.")
+
+    if not errors and not override:
+        payload = {
+            "patient_name": name,
+            "phone": phone,
+            "doctor_id": doctor["id"],
+            "date": date,
+            "time": time_value,
+            "notes": notes,
+        }
+        booking, error = _validate_booking(
+            payload, "en", exclude_appointment_id=exclude_id)
+        if error:
+            errors.append(error)
+        else:
+            values["patient_name"] = booking["patient_name"]
+            values["phone"] = booking["phone"]
+            values["date"] = booking["date"]
+            values["time"] = booking["time"]
+
+    values["doctor_id"] = str(doctor["id"]) if doctor else values["doctor_id"]
+    values["service_id"] = str(service_id) if service_id else ""
+    values["notes"] = notes
+    values["status"] = status if status in db.APPOINTMENT_STATUSES else "pending"
+    return values, errors
+
+
+def _appointment_form_context(values, errors, mode, appointment=None,
+                              override=False):
+    current = values.get("status") if mode == "edit" else None
+    return {
+        "nav": "appointments",
+        "mode": mode,
+        "appointment": appointment,
+        "values": values,
+        "errors": errors,
+        "doctors": db.list_doctors(),
+        "services": db.list_services(),
+        "status_choices": (_appointment_status_options(current)
+                           if mode == "edit"
+                           else list(db.APPOINTMENT_STATUSES)),
+        "status_labels": APPT_STATUS_LABELS,
+        "notes_max": APPT_NOTES_MAX,
+        "override": override,
+    }
+
+
+def _appointment_return_url():
+    return _safe_next(request.form.get("next"),
+                      url_for("admin_appointments"))
+
+
+@app.route("/admin/appointments/new", methods=["GET", "POST"])
+@owner_required
+def admin_appointment_new():
+    if request.method == "POST":
+        values, errors = _validate_admin_appointment_form(request.form)
+        if not errors:
+            appt_id, error = db.create_admin_appointment(
+                patient_name=values["patient_name"], phone=values["phone"],
+                doctor_id=int(values["doctor_id"]),
+                service_id=int(values["service_id"]) if values["service_id"] else None,
+                date=values["date"], time=values["time"],
+                status=values["status"], notes=values["notes"] or None,
+                language=None, source="manual")
+            if error == "slot_taken":
+                errors.append("That doctor already has an active appointment "
+                              "at that date and time.")
+            elif error:
+                errors.append("The appointment could not be saved.")
+            else:
+                db.audit("appointment_created", target="#%d" % appt_id,
+                         detail="Manual booking: %s, %s %s, status %s."
+                                % (values["patient_name"], values["date"],
+                                   values["time"], values["status"]))
+                flash("Appointment created.", "success")
+                return redirect(url_for("admin_appointments"))
+        return render_template(
+            "admin_appointment_edit.html",
+            **_appointment_form_context(values, errors, "new"))
+    values = _appointment_prefill()
+    return render_template(
+        "admin_appointment_edit.html",
+        **_appointment_form_context(values, [], "new"))
+
+
+@app.route("/admin/appointments/<int:appt_id>", methods=["GET", "POST"])
+@owner_required
+def admin_appointment_edit(appt_id):
+    appointment = db.get_appointment(appt_id)
+    if appointment is None:
+        flash("That appointment no longer exists.", "error")
+        return redirect(url_for("admin_appointments"))
+
+    if request.method == "POST":
+        override = bool(request.form.get("override_schedule"))
+        values, errors = _validate_admin_appointment_form(
+            request.form, exclude_id=appt_id, override=override)
+        if not errors:
+            updated, error = db.update_admin_appointment(
+                appt_id,
+                patient_name=values["patient_name"], phone=values["phone"],
+                doctor_id=int(values["doctor_id"]),
+                service_id=(int(values["service_id"])
+                            if values["service_id"] else None),
+                date=values["date"], time=values["time"],
+                notes=values["notes"] or None, status=values["status"])
+            if error == "slot_taken":
+                errors.append("That doctor already has another active "
+                              "appointment at that exact date and time.")
+            elif error == "invalid_transition":
+                errors.append("That status change is not allowed from '%s'."
+                              % (appointment.get("status") or "pending"))
+            elif error == "future":
+                errors.append("Completed and no-show can only be set once the "
+                              "appointment time has passed.")
+            elif error:
+                errors.append("That appointment no longer exists.")
+            else:
+                db.audit(
+                    "appointment_edited", target="#%d" % appt_id,
+                    detail="Edited: %s, %s %s, status %s%s."
+                           % (values["patient_name"], values["date"],
+                              values["time"], values["status"],
+                              "; schedule override used" if override else ""))
+                flash("Appointment updated.", "success")
+                return redirect(url_for("admin_appointments"))
+        return render_template(
+            "admin_appointment_edit.html",
+            **_appointment_form_context(values, errors, "edit",
+                                        appointment=appointment,
+                                        override=override))
+
+    values = _appointment_form_values(appointment)
+    return render_template(
+        "admin_appointment_edit.html",
+        **_appointment_form_context(values, [], "edit",
+                                    appointment=appointment))
+
+
+@app.route("/admin/appointments/<int:appt_id>/status", methods=["POST"])
+@owner_required
+def admin_appointment_status(appt_id):
+    appointment = db.get_appointment(appt_id)
+    if appointment is None:
+        flash("That appointment no longer exists.", "error")
+        return redirect(url_for("admin_appointments"))
+    new_status = (request.form.get("status") or "").strip()
+    updated, error = db.transition_appointment(appt_id, new_status)
+    if error == "invalid_transition":
+        flash("Cannot change a %s appointment to %s."
+              % (appointment.get("status") or "pending",
+                 APPT_STATUS_LABELS.get(new_status, new_status)), "error")
+    elif error == "future":
+        flash("Completed and no-show can only be set once the appointment "
+              "time has passed.", "error")
+    elif error == "slot_taken":
+        flash("That slot is no longer free, so the appointment cannot be "
+              "reopened.", "error")
+    elif error:
+        flash("That status change is not allowed.", "error")
+    else:
+        db.audit("appointment_status", target="#%d" % appt_id,
+                 detail="Status %s -> %s."
+                        % (appointment.get("status") or "pending", new_status))
+        flash("Appointment is now %s."
+              % APPT_STATUS_LABELS.get(new_status, new_status).lower(), "success")
+    return redirect(_appointment_return_url())
+
+
+@app.route("/admin/appointments/<int:appt_id>/cancel", methods=["POST"])
+@owner_required
+def admin_appointment_cancel(appt_id):
+    appointment = db.get_appointment(appt_id)
+    if appointment is None:
+        flash("That appointment no longer exists.", "error")
+        return redirect(url_for("admin_appointments"))
+    if (appointment.get("status") or "pending") == "cancelled":
+        flash("That appointment is already cancelled.", "notice")
+        return redirect(_appointment_return_url())
+    updated, error = db.transition_appointment(appt_id, "cancelled")
+    if error:
+        flash("That appointment cannot be cancelled from its current status.",
+              "error")
+    else:
+        db.audit("appointment_cancelled", target="#%d" % appt_id,
+                 detail="Cancelled; the slot is free again.")
+        flash("Appointment cancelled — the slot is free again.", "success")
+    return redirect(_appointment_return_url())
+
+
+@app.route("/admin/appointments/<int:appt_id>/delete", methods=["POST"])
+@owner_required
+def admin_appointment_delete(appt_id):
+    appointment = db.get_appointment(appt_id)
+    if not appointment:
+        flash("That appointment no longer exists.", "error")
+        return redirect(_appointment_return_url())
+    db.delete_appointment(appt_id)
+    db.audit("appointment_deleted", target="#%d" % appt_id,
+             detail="Permanently deleted: %s, %s %s."
+                    % (appointment.get("patient_name"),
+                       appointment.get("date"), appointment.get("time")))
+    flash("Appointment permanently deleted.", "success")
+    return redirect(_appointment_return_url())
+
+
+def _csv_safe(value):
+    """Neutralise spreadsheet formulas in exported cells."""
+    text = "" if value is None else str(value)
+    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + text
+    return text
+
+
+@app.route("/admin/appointments/export.csv")
+@owner_required
+def admin_appointments_export():
+    """Stream the current filtered/sorted list as a BOM-prefixed CSV."""
+    filters = _appointment_filters()
+    rows = _appointment_rows(filters)
+    header = ["id", "patient", "phone", "doctor", "service", "date", "time",
+              "status", "source", "language", "created_at", "notes"]
+
+    def generate():
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(header)
+        yield "\ufeff" + buffer.getvalue()
+        for row in rows:
+            buffer.seek(0)
+            buffer.truncate(0)
+            writer.writerow([
+                _csv_safe(row.get("id")),
+                _csv_safe(row.get("patient_name")),
+                _csv_safe(row.get("phone")),
+                _csv_safe(row.get("doctor_name_en")
+                          or row.get("doctor_name_bn")),
+                _csv_safe(row.get("service_name_en")
+                          or row.get("service_name_bn")),
+                _csv_safe(row.get("date")),
+                _csv_safe(row.get("time")),
+                _csv_safe(row.get("status")),
+                _csv_safe(row.get("source")),
+                _csv_safe(row.get("language")),
+                _csv_safe(row.get("created_at")),
+                _csv_safe(row.get("notes")),
+            ])
+            yield buffer.getvalue()
+
+    db.audit("appointments_exported", target="appointments.csv",
+             detail="CSV export (%s); %d row(s)."
+                    % (_appointment_filter_summary(filters), len(rows)))
+    response = app.response_class(generate(), mimetype="text/csv")
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = (
+        'attachment; filename="appointments.csv"')
+    return response
+
 
 
 # ─── ADMIN: SETTINGS FIELD SPEC ───────────────────────────────────────────────
@@ -1250,17 +1855,42 @@ def admin_settings():
                                    prompt_bn=prompt_builder.build_system_prompt("bn"),
                                    prompt_en=prompt_builder.build_system_prompt("en"))
 
+        before = dict(settings)
+        changed_keys = []
         for key, _label, _max in ADMIN_TEXT_FIELDS:
             if key in request.form:
-                db.set_setting(key, request.form.get(key, "").strip())
+                new_value = request.form.get(key, "").strip()
+                if before.get(key) != new_value:
+                    changed_keys.append(key)
+                db.set_setting(key, new_value)
         for key, _label, _max in ADMIN_TEXTAREA_FIELDS:
             if key in request.form:
-                db.set_setting(key, request.form.get(key, ""))
+                new_value = request.form.get(key, "")
+                if before.get(key) != new_value:
+                    changed_keys.append(key)
+                db.set_setting(key, new_value)
         for key, _label, _lo, _hi, _unit in ADMIN_INT_FIELDS:
             if key in request.form:
-                db.set_setting(key, typed.get(key, "").strip())
+                new_value = typed.get(key, "").strip()
+                if before.get(key) != new_value:
+                    changed_keys.append(key)
+                db.set_setting(key, new_value)
+        api_key_changed = bool(new_key and before.get("openrouter_api_key") != new_key)
         if new_key:
             db.set_setting("openrouter_api_key", new_key)
+
+        # Audit which keys changed — never their values (the API key is only
+        # ever reported as "api key changed").
+        visible_keys = [k for k in changed_keys if k != "openrouter_api_key"]
+        details = []
+        if visible_keys:
+            details.append("Changed keys: %s." % ", ".join(visible_keys))
+        else:
+            details.append("No clinic/AI/timing values changed.")
+        if api_key_changed:
+            details.append("api key changed")
+        db.audit("settings_saved", target="settings",
+                 detail=" ".join(details))
         flash("Settings saved — the chatbot uses them immediately, "
               "no restart needed.", "success")
         return redirect(url_for("admin_settings"))
@@ -2160,6 +2790,10 @@ def admin_doctor_new():
                 bio_en=values["bio_en"], bio_bn=values["bio_bn"],
                 slot_minutes=values["slot_minutes"], active=values["active"],
                 schedule=schedule)
+            db.audit("doctor_created", target="#%d" % doctor_id,
+                     detail="Created %s; %d weekly range(s)."
+                            % (values["name_en"] or values["name_bn"],
+                               len(schedule)))
             flash("%s was added." % (values["name_en"] or values["name_bn"]),
                   "success")
             return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
@@ -2218,6 +2852,11 @@ def admin_doctor_edit(doctor_id):
                               "— otherwise no slots can be offered.")
         if not errors:
             db.save_doctor_with_schedule(doctor_id, schedule=schedule, **values)
+            db.audit("doctor_edited", target="#%d" % doctor_id,
+                     detail="Updated %s; %d weekly range(s), slot %s min, %s."
+                            % (values["name_en"] or values["name_bn"],
+                               len(schedule), values["slot_minutes"],
+                               "active" if values["active"] else "disabled"))
             flash("Doctor updated.", "success")
             return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
 
@@ -2270,6 +2909,9 @@ def _admin_add_time_off(doctor):
                                 "" if len(affected) != 1 else "s"))
     db.create_time_off(doctor_id, payload["date_from"], payload["date_to"],
                        payload["reason"])
+    db.audit("time_off_added", target="#%d" % doctor_id,
+             detail="Days off %s to %s."
+                    % (payload["date_from"], payload["date_to"]))
     flash("Days off added — the doctor is now unavailable on those dates.",
           "success")
     return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
@@ -2283,6 +2925,9 @@ def admin_time_off_delete(doctor_id, time_off_id):
     if row is None or row["doctor_id"] != doctor_id:
         flash("That days-off range no longer exists.", "error")
     elif db.delete_time_off(time_off_id):
+        db.audit("time_off_removed", target="#%d" % doctor_id,
+                 detail="Removed days off %s to %s."
+                        % (row.get("date_from"), row.get("date_to")))
         flash("Days off removed.", "success")
     else:
         flash("That days-off range no longer exists.", "error")
@@ -2313,6 +2958,11 @@ def admin_doctor_toggle(doctor_id):
                         % (doctor.get("name_en") or doctor.get("name_bn"),
                            len(affected), "s" if len(affected) != 1 else ""))
     db.update_doctor(doctor_id, active=new_active)
+    db.audit("doctor_enabled" if new_active else "doctor_disabled",
+             target="#%d" % doctor_id,
+             detail="%s %s."
+                    % (doctor.get("name_en") or doctor.get("name_bn"),
+                       "enabled" if new_active else "disabled"))
     flash("%s is now %s." % (doctor.get("name_en") or doctor.get("name_bn"),
                              "enabled" if new_active else "disabled"),
           "success")
@@ -2334,6 +2984,9 @@ def admin_doctor_delete(doctor_id):
                  "s" if total != 1 else ""), "error")
         return redirect(url_for("admin_doctors"))
     db.delete_doctor(doctor_id)
+    db.audit("doctor_deleted", target="#%d" % doctor_id,
+             detail="Deleted %s." % (doctor.get("name_en")
+                                     or doctor.get("name_bn")))
     flash("Doctor deleted.", "success")
     return redirect(url_for("admin_doctors"))
 
@@ -2354,7 +3007,10 @@ def admin_service_new():
     if request.method == "POST":
         values, errors = _validate_service_form(request.form)
         if not errors:
-            db.create_service(**values)
+            service_id = db.create_service(**values)
+            db.audit("service_created", target="#%d" % service_id,
+                     detail="Created %s."
+                            % (values["name_en"] or values["name_bn"]))
             flash("%s was added." % (values["name_en"] or values["name_bn"]),
                   "success")
             return redirect(url_for("admin_services"))
@@ -2384,6 +3040,10 @@ def admin_service_edit(service_id):
         values, errors = _validate_service_form(request.form)
         if not errors:
             db.update_service(service_id, **values)
+            db.audit("service_edited", target="#%d" % service_id,
+                     detail="Updated %s (%s)."
+                            % (values["name_en"] or values["name_bn"],
+                               "active" if values["active"] else "disabled"))
             flash("Service updated.", "success")
             return redirect(url_for("admin_services"))
     return render_template("admin_service_edit.html", nav="services",
@@ -2402,6 +3062,11 @@ def admin_service_toggle(service_id):
         return redirect(url_for("admin_services"))
     new_active = 0 if service.get("active") else 1
     db.update_service(service_id, active=new_active)
+    db.audit("service_enabled" if new_active else "service_disabled",
+             target="#%d" % service_id,
+             detail="%s %s."
+                    % (service.get("name_en") or service.get("name_bn"),
+                       "enabled" if new_active else "disabled"))
     flash("%s is now %s." % (service.get("name_en") or service.get("name_bn"),
                              "enabled" if new_active else "disabled"),
           "success")
@@ -2423,6 +3088,9 @@ def admin_service_delete(service_id):
                  "s" if total != 1 else ""), "error")
         return redirect(url_for("admin_services"))
     db.delete_service(service_id)
+    db.audit("service_deleted", target="#%d" % service_id,
+             detail="Deleted %s." % (service.get("name_en")
+                                     or service.get("name_bn")))
     flash("Service deleted.", "success")
     return redirect(url_for("admin_services"))
 
@@ -2443,6 +3111,11 @@ def admin_confirm_impact():
             db.save_doctor_with_schedule(doctor_id,
                                          schedule=payload.get("schedule"),
                                          **payload.get("values", {}))
+            values = payload.get("values", {})
+            db.audit("doctor_edited", target="#%d" % doctor_id,
+                     detail="Confirmed impact: updated %s; %d weekly range(s)."
+                            % (values.get("name_en") or values.get("name_bn"),
+                               len(payload.get("schedule") or [])))
             flash("Doctor updated. The listed appointments were left "
                   "untouched.", "success")
         return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
@@ -2451,6 +3124,9 @@ def admin_confirm_impact():
         if db.get_doctor(doctor_id):
             db.create_time_off(doctor_id, payload["date_from"],
                                payload["date_to"], payload.get("reason"))
+            db.audit("time_off_added", target="#%d" % doctor_id,
+                     detail="Confirmed impact: days off %s to %s."
+                            % (payload["date_from"], payload["date_to"]))
             flash("Days off added. The listed appointments were left "
                   "untouched.", "success")
         return redirect(url_for("admin_doctor_edit", doctor_id=doctor_id))
@@ -2458,6 +3134,8 @@ def admin_confirm_impact():
         doctor_id = payload.get("doctor_id")
         if db.get_doctor(doctor_id):
             db.update_doctor(doctor_id, active=0)
+            db.audit("doctor_disabled", target="#%d" % doctor_id,
+                     detail="Confirmed impact: doctor disabled.")
             flash("Doctor disabled. The listed appointments were left "
                   "untouched.", "success")
         return redirect(url_for("admin_doctors"))

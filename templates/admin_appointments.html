@@ -1,0 +1,278 @@
+{% extends "admin_base.html" %}
+{% block title %}Appointments{% endblock %}
+{% block heading %}Appointments{% endblock %}
+{% block style %}
+  .appt-head { display:flex; align-items:flex-start; gap:14px; flex-wrap:wrap;
+                margin-bottom:18px; }
+  .appt-head h2 { font-size:15px; font-weight:700; }
+  .appt-head p { font-size:12.5px; color:var(--muted); margin-top:3px; }
+  .appt-head .actions { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
+  .filters { background:#fff; border:1px solid var(--line); border-radius:14px;
+             padding:16px 18px; margin-bottom:18px; }
+  .filters .row { display:grid; grid-template-columns:repeat(4,1fr); gap:12px;
+                  align-items:end; }
+  .filters .row + .row { margin-top:12px; }
+  .filters label.f { margin-bottom:4px; }
+  .filters .inp { padding:8px 10px; font-size:13px; }
+  .filters .check { display:flex; align-items:center; gap:8px; font-size:13px;
+                    color:#374151; padding-bottom:9px; }
+  .filters .btns { display:flex; gap:8px; align-items:center; padding-bottom:1px; }
+  .filters a.clear { font-size:12.5px; color:var(--muted); margin-left:6px; }
+  .table-card { background:#fff; border:1px solid var(--line); border-radius:14px;
+                overflow:hidden; }
+  .table-wrap { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; min-width:1180px; }
+  thead th { background:#f9fafb; padding:10px 12px; text-align:left; font-size:11px;
+             font-weight:700; color:var(--muted); text-transform:uppercase;
+             letter-spacing:.5px; border-bottom:1px solid var(--line);
+             white-space:nowrap; }
+  tbody tr { border-bottom:1px solid #f3f4f6; }
+  tbody tr:hover { background:#fafbff; }
+  tbody tr:last-child { border:none; }
+  td { padding:11px 12px; font-size:13px; vertical-align:middle;
+       font-family:'Hind Siliguri','Inter',sans-serif; }
+  .id { color:#9ca3af; font-size:12px; }
+  .patient { font-weight:600; }
+  .phone { color:var(--brand); font-weight:500; white-space:nowrap; }
+  .notes { max-width:180px; color:#4b5563; font-size:12.5px; }
+  .when { white-space:nowrap; font-weight:600; }
+  .when small { display:block; color:var(--muted); font-weight:500; }
+  .badge.status { text-transform:capitalize; }
+  .badge.status.pending   { background:#fffbeb; color:#92400e; }
+  .badge.status.confirmed { background:#eff6ff; color:#1d4ed8; }
+  .badge.status.completed { background:#f0fdf4; color:#15803d; }
+  .badge.status.cancelled { background:#f3f4f6; color:#6b7280; }
+  .badge.status.no-show   { background:#fef2f2; color:#b91c1c; }
+  .badge.src { background:#f3f4f6; color:#4b5563; }
+  .badge.src.manual { background:#eef2ff; color:#4338ca; }
+  .warn { display:inline-flex; align-items:center; gap:4px; background:#fff7ed;
+          color:#9a3412; border:1px solid #fed7aa; border-radius:6px;
+          padding:2px 8px; font-size:11px; font-weight:700; cursor:help; }
+  .muted { color:var(--muted); font-size:12px; }
+  .row-actions { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .row-actions form { display:flex; gap:5px; align-items:center; }
+  .row-actions select { padding:5px 7px; border:1px solid var(--line);
+                        border-radius:6px; font-size:12px; font-family:inherit; }
+  .link-btn { padding:5px 10px; border:1px solid var(--line); border-radius:6px;
+              background:#fff; color:#374151; font-size:12px; font-weight:600;
+              text-decoration:none; font-family:inherit; cursor:pointer; }
+  .link-btn:hover { background:#f9fafb; }
+  .danger-btn { padding:5px 10px; border:1px solid #fecaca; border-radius:6px;
+                background:#fff; color:var(--danger); font-size:12px;
+                font-weight:600; font-family:inherit; cursor:pointer; }
+  .danger-btn:hover { background:#fef2f2; }
+  .empty { text-align:center; padding:48px 20px; color:#9ca3af; }
+  .empty .ic { font-size:40px; margin-bottom:10px; }
+  .pager { display:flex; gap:6px; align-items:center; justify-content:center;
+           padding:16px; flex-wrap:wrap; }
+  .pager a, .pager span { padding:6px 11px; border-radius:7px; font-size:12.5px;
+                          text-decoration:none; color:#374151; border:1px solid var(--line);
+                          background:#fff; }
+  .pager .current { background:var(--brand); color:#fff; border-color:var(--brand); }
+  .pager .disabled { color:#c0c4cc; background:#f9fafb; }
+  .summary-line { font-size:12.5px; color:var(--muted); }
+  @media (max-width:1000px) { .filters .row { grid-template-columns:1fr 1fr; } }
+  @media (max-width:640px) { .filters .row { grid-template-columns:1fr; } }
+{% endblock %}
+{% block content %}
+  <div class="appt-head">
+    <div>
+      <h2>📋 Appointments</h2>
+      <p class="summary-line">
+        {{ total }} matching appointment{{ 's' if total != 1 }}
+        {% if filters.attention %} · needs attention only{% endif %}
+        · {{ per_page }} per page
+      </p>
+    </div>
+    <div class="actions">
+      <a class="btn ghost sm" href="{{ url_for('admin_appointments_export', **filters) }}"
+         title="CSV export of the current filters and sort">⬇ Export CSV</a>
+      <a class="btn sm" href="{{ url_for('admin_appointment_new') }}">＋ New booking</a>
+    </div>
+  </div>
+
+  <form class="filters" method="GET" action="{{ url_for('admin_appointments') }}">
+    <div class="row">
+      <div>
+        <label class="f" for="f-from">From date</label>
+        <input class="inp" id="f-from" type="date" name="date_from" value="{{ filters.date_from }}"/>
+      </div>
+      <div>
+        <label class="f" for="f-to">To date</label>
+        <input class="inp" id="f-to" type="date" name="date_to" value="{{ filters.date_to }}"/>
+      </div>
+      <div>
+        <label class="f" for="f-doctor">Doctor</label>
+        <select class="inp" id="f-doctor" name="doctor">
+          <option value="">All doctors</option>
+          {% for d in doctors %}
+          <option value="{{ d.id }}" {{ 'selected' if filters.doctor == d.id|string }}>
+            {{ d.name_en or d.name_bn or ('Doctor #' ~ d.id) }}{{ ' (disabled)' if not d.active }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label class="f" for="f-status">Status</label>
+        <select class="inp" id="f-status" name="status">
+          <option value="">All statuses</option>
+          {% for s in statuses %}
+          <option value="{{ s }}" {{ 'selected' if filters.status == s }}>{{ status_labels.get(s, s) }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label class="f" for="f-source">Source</label>
+        <select class="inp" id="f-source" name="source">
+          <option value="">All sources</option>
+          <option value="chat" {{ 'selected' if filters.source == 'chat' }}>Chat</option>
+          <option value="manual" {{ 'selected' if filters.source == 'manual' }}>Manual</option>
+        </select>
+      </div>
+      <div>
+        <label class="f" for="f-q">Search patient or phone</label>
+        <input class="inp" id="f-q" type="search" name="q" maxlength="100"
+               value="{{ filters.q }}" placeholder="Name or phone"/>
+      </div>
+      <div class="check">
+        <input id="f-attn" type="checkbox" name="attention" value="1"
+               {{ 'checked' if filters.attention }}/>
+        <label for="f-attn">⚠ Needs attention only</label>
+      </div>
+      <div class="btns">
+        <button class="btn sm" type="submit">Apply filters</button>
+        <a class="clear" href="{{ url_for('admin_appointments') }}">Clear</a>
+      </div>
+    </div>
+    <input type="hidden" name="sort" value="{{ filters.sort }}"/>
+  </form>
+
+  <div class="table-card">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Patient</th>
+            <th>Phone</th>
+            <th>Doctor</th>
+            <th>Service</th>
+            <th>
+              {% if filters.sort == 'created' %}
+              <a href="{{ query_url(sort='date', page=1) }}">Date / time ↑</a>
+              {% else %}
+              <span>Date / time ↑</span>
+              {% endif %}
+            </th>
+            <th>Status</th>
+            <th>Source</th>
+            <th>Lang</th>
+            <th>
+              {% if filters.sort == 'created' %}
+              <span>Created ↓</span>
+              {% else %}
+              <a href="{{ query_url(sort='created', page=1) }}">Created ↓</a>
+              {% endif %}
+            </th>
+            <th>Notes</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for a in rows %}
+          <tr>
+            <td class="id">#{{ a.id }}</td>
+            <td>
+              <div class="patient">{{ a.patient_name or '—' }}</div>
+              {% if a.needs_attention %}
+              <span class="warn" title="{{ a.attention_reasons|join('; ') }}">⚠ Needs attention</span>
+              {% endif %}
+            </td>
+            <td class="phone">{{ a.phone or '—' }}</td>
+            <td>{{ a.doctor_name_en or a.doctor_name_bn or '—' }}</td>
+            <td>{{ a.service_name_en or a.service_name_bn or '—' }}</td>
+            <td class="when">{{ a.date or '—' }}<small>{{ a.time or '' }}</small></td>
+            <td><span class="badge status {{ status_class.get(a.status, '') }}">{{ status_labels.get(a.status, a.status) }}</span></td>
+            <td><span class="badge src {{ 'manual' if a.source == 'manual' }}">{{ source_labels.get(a.source, a.source or '—') }}</span></td>
+            <td class="muted">{{ a.language or '—' }}</td>
+            <td class="muted">{{ a.created_at[:16].replace('T', ' ') if a.created_at else '—' }}</td>
+            <td class="notes">
+              {% if a.notes %}{{ a.notes[:60] }}{% if a.notes|length > 60 %}…{% endif %}
+              {% else %}<span class="muted">—</span>{% endif %}
+            </td>
+            <td>
+              <div class="row-actions">
+                <a class="link-btn" href="{{ url_for('admin_appointment_edit', appt_id=a.id) }}">Edit</a>
+
+                {% set next_statuses = transitions.get(a.status, []) %}
+                {% if next_statuses %}
+                <form method="POST"
+                      action="{{ url_for('admin_appointment_status', appt_id=a.id) }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+                  <input type="hidden" name="next" value="{{ query_url() }}"/>
+                  <select name="status" aria-label="New status">
+                    {% for s in statuses %}
+                    {% if s in next_statuses %}
+                    <option value="{{ s }}">{{ status_labels.get(s, s) }}</option>
+                    {% endif %}
+                    {% endfor %}
+                  </select>
+                  <button class="link-btn" type="submit">Go</button>
+                </form>
+                {% endif %}
+
+                {% if 'cancelled' in next_statuses %}
+                <form method="POST"
+                      action="{{ url_for('admin_appointment_cancel', appt_id=a.id) }}"
+                      onsubmit="return confirm('Cancel this appointment and free its slot?')">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+                  <input type="hidden" name="next" value="{{ query_url() }}"/>
+                  <button class="danger-btn" type="submit">Cancel</button>
+                </form>
+                {% endif %}
+
+                <form method="POST"
+                      action="{{ url_for('admin_appointment_delete', appt_id=a.id) }}"
+                      onsubmit="return confirm('Permanently delete appointment #{{ a.id }}? This cannot be undone.')">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"/>
+                  <input type="hidden" name="next" value="{{ query_url() }}"/>
+                  <button class="danger-btn" type="submit" title="Delete permanently">🗑</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if not rows %}
+    <div class="empty">
+      <div class="ic">📭</div>
+      <p>No appointments match these filters.</p>
+    </div>
+    {% endif %}
+    {% if pages > 1 %}
+    <div class="pager">
+      {% if page > 1 %}
+      <a href="{{ query_url(page=page - 1) }}">← Previous</a>
+      {% else %}
+      <span class="disabled">← Previous</span>
+      {% endif %}
+      {% for p in range(1, pages + 1) %}
+        {% if p == page %}
+        <span class="current">{{ p }}</span>
+        {% elif p == 1 or p == pages or (p >= page - 2 and p <= page + 2) %}
+        <a href="{{ query_url(page=p) }}">{{ p }}</a>
+        {% endif %}
+      {% endfor %}
+      {% if page < pages %}
+      <a href="{{ query_url(page=page + 1) }}">Next →</a>
+      {% else %}
+      <span class="disabled">Next →</span>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+{% endblock %}
